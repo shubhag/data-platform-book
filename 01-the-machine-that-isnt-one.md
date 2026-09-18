@@ -251,7 +251,7 @@ The payoff is the sentence I would most like you to take away from this chapter:
 
 > **Deliver at least once, and make the receiver idempotent. You now have exactly-once *effects*, for a fraction of the cost of exactly-once *delivery*.**
 
-This is the pattern that real pipelines are built on. Chapter 8 traces it through every hop of a complete architecture.
+This is the pattern that real pipelines are built on. Chapter 9 traces it through every hop of a complete architecture.
 
 ### Retrying well
 

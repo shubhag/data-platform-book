@@ -1,8 +1,8 @@
-# Chapter 8 — The Whole Machine
+# Chapter 9 — The Whole Machine
 
-## 8.1 Lantern, complete
+## 9.1 Lantern, complete
 
-Seven chapters ago Lantern was one server running `SELECT * FROM documents WHERE body LIKE '%kafka%'`. Here is what it is now.
+Eight chapters ago Lantern was one server running `SELECT * FROM documents WHERE body LIKE '%kafka%'`. Here is what it is now.
 
 ```
 ┌──────────────┐                    ┌─────────────────────────────────────┐
@@ -64,9 +64,11 @@ Every box in that diagram was a decision, and every decision has a section numbe
 
 **S3 holds the raw layer.** The thing everything can be re-derived from (§4.2). It is the reason a bug is a reprocess rather than an incident.
 
+**The lakehouse answers questions about the system.** Analytical queries never touch PostgreSQL (§8.2); they run over columnar files in the lake, organised bronze → silver → gold (§8.8), with a transaction log making the folder behave like a table (§8.6). And gold flows *back* into the product as document features for ranking (§8.11), which is the loop that makes the analytics layer worth paying for.
+
 **An alias sits in front of the index.** So a reindex, a mapping change, or an embedding model upgrade is an atomic swap with instant rollback (§2.10).
 
-## 8.2 One edit, end to end
+## 9.2 One edit, end to end
 
 Trace a single change. An employee fixes a typo in a document titled *Diagnosing CrashLoopBackOff*, and clicks save.
 
@@ -103,7 +105,7 @@ end to end                                ~1.5 – 3 s
 
 Two observations about that budget worth carrying into your own systems. First, the largest term is a *configuration default*, not the pipeline — which is a useful reminder that the thing you assume is slow is often not the thing that is slow. Second, you cannot know any of this without measuring it, and having measured it you know exactly where to push if the requirement tightens.
 
-## 8.3 How the concerns thread through
+## 9.3 How the concerns thread through
 
 The interesting thing about an assembled system is that certain concerns are not located in any one component. They run through all of them, and this is where a whiteboard diagram stops being enough.
 
@@ -167,7 +169,7 @@ Worth knowing, because cost drives more architectural decisions than performance
 
 **Always-on streaming clusters** — which is exactly why the analytics path uses `availableNow` on a schedule rather than a permanently running job (§7.3).
 
-## 8.4 The eight ideas
+## 9.4 The eight ideas
 
 Here is the thing I most want you to take from this book.
 
@@ -203,7 +205,7 @@ The same curve, five times, in five different unit systems. Wait longer, amortis
 
 Exactly-once *delivery* over a network is impossible. Exactly-once *effect* is easy: write to a deterministic key so that a replay overwrites rather than accumulates.
 
-This is the pattern §8.3 traced through every hop of Lantern, and it is the answer to a startling proportion of the hard questions in this field. **When in doubt, make the write idempotent.**
+This is the pattern §9.3 traced through every hop of Lantern, and it is the answer to a startling proportion of the hard questions in this field. **When in doubt, make the write idempotent.**
 
 ### 6. Event time is not processing time, and clocks lie
 
@@ -225,7 +227,7 @@ That last pattern appeared four separate times — OpenSearch alias swaps, Kappa
 
 The payoff is cultural as much as technical. In a system built this way, a bug is *"reprocess Tuesday"* rather than an incident with a postmortem. That difference compounds over years, in how much risk your team is willing to take and therefore how fast it can move.
 
-## 8.5 Forty questions
+## 9.5 Forty questions
 
 Reading produces a comfortable feeling of understanding that questions dispel very quickly. If you can answer these without looking things up, you have what this book set out to give you. If you cannot answer one, the section reference tells you where to go.
 
@@ -289,13 +291,13 @@ Reading produces a comfortable feeling of understanding that questions dispel ve
 45. Name the three conditions for Structured Streaming's exactly-once guarantee. (§7.6)
 
 **The whole machine**
-46. Trace a single document edit from a PostgreSQL commit to a user seeing it, naming the guarantee at each hop. (§8.2)
-47. A bug corrupted three days of your search index. Walk through recovery with zero downtime. (§8.3)
-48. Lantern has no distributed transactions anywhere. Why doesn't it need any? (§8.3)
+46. Trace a single document edit from a PostgreSQL commit to a user seeing it, naming the guarantee at each hop. (§9.2)
+47. A bug corrupted three days of your search index. Walk through recovery with zero downtime. (§9.3)
+48. Lantern has no distributed transactions anywhere. Why doesn't it need any? (§9.3)
 
 (There are forty-eight. I was not going to cut eight good questions to make the heading accurate.)
 
-## 8.6 How to actually learn this
+## 9.6 How to actually learn this
 
 A reading plan, and then the only advice in this book I would call essential.
 
@@ -307,11 +309,11 @@ A reading plan, and then the only advice in this book I would call essential.
 
 **Week 4 — streaming.** Chapter 5, then 6 or 7 depending on what your team uses. Run a local Kafka. Produce, consume, and then **kill the consumer mid-batch** and watch duplicates appear in your output. Then make the write idempotent and watch them stop mattering. That single exercise teaches §1.7, §4.7, §5.5, and §5.6 simultaneously, in about fifteen minutes, in a way no amount of reading does.
 
-**Then re-read Chapter 8.** Especially §8.4. Every production incident you see for the next two years will be an instance of one of those eight ideas, and recognising which one is most of the diagnosis.
+**Then re-read Chapter 9.** Especially §9.4. Every production incident you see for the next two years will be an instance of one of those eight ideas, and recognising which one is most of the diagnosis.
 
 And the essential advice: **break things on purpose, in an environment where it is safe.** The understanding that matters in this field is not the kind you get from prose. It is the kind you get from having watched a system misbehave and worked out why. Every section in this book that felt sharp to you was probably sharp because somebody, once, watched it go wrong.
 
-## 8.7 Where to go next
+## 9.7 Where to go next
 
 The books and documentation that are genuinely worth your time, rather than a comprehensive list.
 

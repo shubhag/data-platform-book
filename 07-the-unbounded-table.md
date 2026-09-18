@@ -427,4 +427,4 @@ The streaming engine models a stream as an unbounded table and maintains the ans
 
 We now have every component Lantern needs. A source of truth, a change stream, a low-latency streaming path, a high-throughput batch path, a lake, a search index, and vectors.
 
-What we have not yet done is look at the whole thing at once — and there are patterns that only become visible from there. The next chapter assembles it, traces a single edit from a database commit to a user's screen, and then names the eight ideas that have been recurring under different names since Chapter 1.
+What we do not have is a way to answer questions *about* Lantern — how search quality is trending, which teams' documents go unfound, whether last quarter was better than the one before. That is a different workload with a different engine behind it, and it is where the lake finally becomes a table. The next chapter builds it: OLAP, the lakehouse, Delta Lake, and the medallion architecture, on the engine you have just learned.

@@ -305,3 +305,61 @@ Terms are grouped by where they first matter, with a section reference to the fu
 **Tungsten** — Whole-stage code generation, off-heap memory, vectorized reads. §7.2
 
 **Unbounded table** — The model: a stream is a table that keeps growing, and a query over it is maintained incrementally. §7.3
+
+## Analytics, lakehouse, and Databricks (Chapter 8)
+
+**Auto Loader** — Databricks' incremental file source; tracks seen files in state rather than by listing the directory. §8.7
+
+**Bronze / silver / gold** — The medallion layers: as-received, made-true, shaped-for-a-consumer. Data flows only forward, and each layer is rebuildable from the previous one. §8.8
+
+**CDF (Change Data Feed)** — Per-commit record of which rows changed in a Delta table, so downstream jobs consume changes instead of re-reading. §8.6
+
+**Checkpoint (Delta)** — A Parquet snapshot of the log state written every ~10 commits, so readers do not replay the whole history. §8.6
+
+**Column pruning** — Reading only the columns a query references. The main reason columnar beats row storage for analytics. §8.3
+
+**Dimension table** — One row per *thing* (user, document, team, date). Short, wide, slowly changing; supplies the attributes you filter and group by. §8.4
+
+**Deletion vector** — A bitmap marking deleted row positions, avoiding a full file rewrite on small deletes. §8.6
+
+**Delta Lake** — Open table format: Parquet files plus a `_delta_log` transaction log that defines which files are the table. §8.6
+
+**DBU** — Databricks Billing Unit. You pay DBUs *and* your cloud provider's VM cost. §8.7
+
+**Fact table** — One row per *event*. Long, narrow, append-mostly; foreign keys plus measures. §8.4
+
+**File skipping** — Using per-file min/max statistics to avoid opening files that cannot match the predicate. Only works if data is clustered. §8.3
+
+**Grain** — What one row of a table means. Declare it in the table comment before writing the pipeline. §8.4
+
+**Lakehouse** — Open files in cheap object storage plus a transaction log, giving lake economics with warehouse semantics. §8.5
+
+**Liquid clustering / `ZORDER`** — Physically reorganising rows so similar values share files, which is what makes file skipping work. Liquid clustering can be changed later; Z-order cannot. §8.6, §8.9
+
+**Medallion architecture** — The bronze/silver/gold organising principle for a lakehouse. §8.8
+
+**`MERGE`** — Transactional upsert by key. The idempotent write of §4.7, in SQL. §8.6
+
+**OLAP / OLTP** — Analytical (few queries, enormous scans, aggregates) versus transactional (many queries, single rows, milliseconds). §8.2
+
+**`OPTIMIZE`** — Compaction of small files into large ones; the required maintenance job for any streaming-written table. §8.6
+
+**Optimistic concurrency** — Delta's writer protocol: write files, attempt an atomic commit, detect conflicts, retry. §8.6
+
+**Photon** — Databricks' C++ vectorized execution engine. Higher rate, shorter runtime; not for Python UDFs. §8.7
+
+**Partition pruning** — Skipping whole directories via the partition column. Defeated by wrapping that column in a function. §8.3
+
+**SCD Type 1 / Type 2** — Overwrite the dimension, versus keep a row per version with validity ranges. Type 2 is what makes reprocessing deterministic. §8.4
+
+**Snapshot isolation** — Readers resolve the log once and read a fixed file set; writers never block them. §8.6
+
+**Star schema** — One fact table surrounded by one join's worth of dimensions. Snowflaking it further is usually a mistake. §8.4
+
+**Time travel** — Querying an earlier table version (`VERSION AS OF`, `TIMESTAMP AS OF`) and `RESTORE` to undo a bad job. Bounded by `VACUUM` retention. §8.6
+
+**Unity Catalog** — Databricks' governance layer: `catalog.schema.table`, grants, lineage, audit, Delta Sharing. §8.7
+
+**`VACUUM`** — Deletes files no longer referenced by the retention window. Destroys time travel beyond it. §8.6
+
+**Vectorized execution** — Processing ~1,000 column values per loop iteration instead of one row at a time. §8.3

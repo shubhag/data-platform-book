@@ -10,7 +10,7 @@ The goal is not mastery. Mastery of any one of these systems takes years and is 
 
 ## How it is organised
 
-There are eight chapters and two appendices.
+There are nine chapters and two appendices.
 
 **Chapter 1, *The Machine That Isn't One*,** is the foundation. It is about what happens to your assumptions when a program stops running on one computer and starts running on fifty. Everything in the rest of the book is a special case of what this chapter describes. If you read only one chapter, read this one.
 
@@ -22,7 +22,9 @@ There are eight chapters and two appendices.
 
 **Chapters 5, 6, and 7** are about the three systems that dominate modern data movement and processing: **Kafka** (*The Log*), **Flink** (*Time*), and **Spark** (*The Unbounded Table*). Each chapter is organised around the one central idea that system is built on, because once you have that idea, the rest of the system is a consequence of it.
 
-**Chapter 8, *The Whole Machine*,** assembles everything into a single working architecture and traces one piece of data through it from end to end. It also contains a self-test, because reading creates a comfortable illusion of understanding that questions dispel very quickly.
+**Chapter 8, *The Warehouse and the Lake*,** is about analytics: why the questions a business asks need a completely different kind of database, how columnar engines answer them, and how the modern answer — the lakehouse, Delta Lake, Databricks, and the medallion architecture — is assembled. It assumes no prior knowledge of OLAP.
+
+**Chapter 9, *The Whole Machine*,** assembles everything into a single working architecture and traces one piece of data through it from end to end. It also contains a self-test, because reading creates a comfortable illusion of understanding that questions dispel very quickly.
 
 The appendices hold a glossary and a set of reference tables — the things you will want to look up rather than read.
 
@@ -40,7 +42,7 @@ Lantern is a search platform inside a mid-sized company. It indexes a few hundre
 
 That one sentence contains, hiding inside it, nearly every problem in this book. Fast means partitioning and caching. Relevant means ranking, and eventually embeddings. Current means a streaming pipeline. *Hundreds of millions* means it doesn't fit on one machine. And "expects" means somebody gets paged when it doesn't work.
 
-We will build Lantern, piece by piece, across eight chapters.
+We will build Lantern, piece by piece, across nine chapters.
 
 ## What I have deliberately left out
 

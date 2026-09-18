@@ -35,7 +35,7 @@ receive → (process and acknowledge atomically)     exactly-once
 | **At-least-once** | `acks=all` + idempotence | ack after processing | **almost everything** |
 | Exactly-once | transactions | offsets inside the transaction | financial counts, billing |
 
-**The rule:** at-least-once delivery + idempotent sink = exactly-once *effect*, at no throughput cost. §1.7, §5.6, §8.3
+**The rule:** at-least-once delivery + idempotent sink = exactly-once *effect*, at no throughput cost. §1.7, §5.6, §9.3
 
 **Four ways to make a write idempotent** (§4.7):
 1. **Upsert on a natural key** — best option
@@ -76,6 +76,17 @@ receive → (process and acknowledge atomically)     exactly-once
 | Partition size | 100 MB – 1 GB |
 | Partition key | appears in nearly every WHERE clause; usually a date |
 | Never partition by | high-cardinality keys (`user_id`) |
+
+### Lakehouse / Delta (§8.6, §8.9)
+| Thing | Target |
+|---|---|
+| Compacted file size | **~1 GB** (`OPTIMIZE` default 1 GB; 128 MB–1 GB acceptable) |
+| Minimum partition size | **1 GB** — below this, do not partition at all |
+| Don't partition below | ~1 TB total table size; cluster instead |
+| Clustering columns | the **1–3** columns in most `WHERE` clauses |
+| `OPTIMIZE` cadence | nightly on any streaming-written table, or enable auto-compaction |
+| `VACUUM` retention | 7 days default; raise **before** you need older time travel |
+| Cluster auto-termination | **15–30 min**, on every interactive cluster, always |
 
 ### Spark (§7.2, §7.7)
 | Thing | Target |
@@ -137,7 +148,7 @@ All the same trade-off. Wait longer → bigger batches → better throughput and
 | Spark first batch never finishes | no `maxOffsetsPerTrigger` | §7.4 |
 | Spark streaming state grows forever | missing `withWatermark` | §7.5 |
 | Millions of tiny files | short trigger × high shuffle partitions | §4.4, §7.7 |
-| Duplicates in a sink | at-least-once with a non-idempotent write | §4.7, §8.3 |
+| Duplicates in a sink | at-least-once with a non-idempotent write | §4.7, §9.3 |
 
 ---
 
@@ -229,6 +240,16 @@ spark.sql("SET -v")         # all current configuration
 6. Notify **downstream** consumers (lineage).
 7. Reset the **bookmark** explicitly and completely.
 
+### A new Delta table (§8.8, §8.9)
+- [ ] Grain written in the table comment, in one sentence
+- [ ] Layer decided: bronze (no logic), silver (true), or gold (shaped for one named consumer)
+- [ ] Partitioned only if partitions exceed ~1 GB; otherwise `CLUSTER BY`
+- [ ] Clustered on the columns queries actually filter by
+- [ ] Write is idempotent: `MERGE` on a key, or `CREATE OR REPLACE` over a bounded window
+- [ ] `OPTIMIZE` and `VACUUM` scheduled; retention chosen deliberately
+- [ ] Quality expectations defined, with drop-vs-fail decided per rule
+- [ ] Grants applied in Unity Catalog; PII not readable by default
+
 ### A new streaming job
 1. What **bounds the state**? (window, timer, or TTL — there is no fourth answer)
 2. Event time or processing time, and **what is the watermark delay**?
@@ -242,7 +263,7 @@ spark.sql("SET -v")         # all current configuration
 
 ## B.8 The eight recurring ideas
 
-The compressed form of §8.4. When a new system confuses you, one of these is usually the key.
+The compressed form of §9.4. When a new system confuses you, one of these is usually the key.
 
 1. **Partitioning gives parallelism, and brings skew.**
 2. **Replication gives durability, and forces the sync/async choice.**
