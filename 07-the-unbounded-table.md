@@ -17,7 +17,7 @@ We need the batch engine first, because Structured Streaming is built directly o
 ## 7.2 How Spark runs a job
 
 ```
-  Driver  (your program; holds the SparkSession)
+  Driver  (your program; holds the SparkSession — see below)
      │     builds a logical plan
      │     → Catalyst optimizer → physical plan → DAG of stages
      ▼
@@ -34,7 +34,33 @@ The **driver** runs your code, builds the execution plan, schedules work, and co
 
 A **partition** is a slice of the data, and the rule that governs everything is: **one task processes one partition**. So your parallelism equals your partition count, capped by the total number of executor cores. Too few partitions and most of your cluster is idle. Too many and you pay scheduling overhead for tasks that do almost nothing.
 
-An **action** — `count()`, `write()`, `collect()` — triggers a **job**. The job is divided into **stages**, and the dividing lines are **shuffle boundaries**. Within a stage, every task runs independently with no data movement; between stages, data is redistributed across the network.
+An **action** — `count()`, `write()`, `collect()` — triggers a **job**. The job is divided into **stages**, and the dividing lines are **shuffle boundaries**. Within a stage, every task runs independently with no data movement; between stages, data is redistributed across the network. Those stages form a **DAG** — a directed acyclic graph, meaning the arrows point one way and never loop back — which is what the Spark UI draws for you and what the driver walks when scheduling.
+
+### What you actually write
+
+Before the machinery, the thing you type. Spark has had three APIs over its life, and the difference between them is the single largest performance factor in this chapter — so they need naming properly rather than in passing.
+
+Everything starts from a **SparkSession**, the object your program uses to talk to the cluster. `spark.read...` gives you data; `spark.sql("...")` runs a query. In a notebook it already exists as `spark`.
+
+The **RDD** — Resilient Distributed Dataset — is the original API, from 2012. An RDD is a distributed collection of arbitrary Java or Python objects, and you transform it by handing Spark a function:
+
+```python
+rdd.filter(lambda r: r["country"] == "FR").map(lambda r: r["latency_ms"])
+```
+
+Spark distributes and runs that function and recovers it after a failure, which in 2012 was the whole point. What it cannot do is *understand* it. The lambda is a black box.
+
+The **DataFrame** is the modern API, and it is a distributed table: named columns, known types, described by a schema. You transform it by naming columns and operations rather than by supplying a function:
+
+```python
+df.filter(col("country") == "FR").select("latency_ms")
+```
+
+That looks like cosmetic sugar for the RDD version. It is not, and the difference is the subject of the next subsection. `col("country") == "FR"` is not a function Spark must call; it is a *description of a comparison* that Spark can read, rewrite, reorder, and push down into the file reader. SQL — `spark.sql("SELECT latency_ms FROM views WHERE country = 'FR'")` — produces the identical plan, because SQL and DataFrames compile to the same thing.
+
+A **Dataset** is the typed variant of a DataFrame, available in Scala and Java: compile-time type checking over the same optimised engine. In Python, the language has no static types to enforce, so `DataFrame` is what you get and the distinction does not arise.
+
+Every code example in this chapter is DataFrames or SQL. RDDs appear once more, as something to avoid.
 
 ### Laziness, and why it is the point
 
@@ -72,7 +98,7 @@ Long lineages become expensive to replay, so **checkpointing** writes a partitio
 
 ### The five things to tune
 
-**`spark.sql.shuffle.partitions`** — the number of partitions produced by a shuffle. It defaults to **200**, and 200 is wrong for almost everybody. On a small dataset you get 200 tiny tasks whose scheduling overhead exceeds their work. On a large one you get 200 enormous partitions that spill to disk. Target roughly **100–200 MB per partition** and set it accordingly, or let AQE handle it.
+**`spark.sql.shuffle.partitions`** — the number of partitions produced by a shuffle. It defaults to **200**, and 200 is wrong for almost everybody. On a small dataset you get 200 tiny tasks whose scheduling overhead exceeds their work. On a large one you get 200 enormous partitions that spill to disk. Target roughly **100–200 MB per partition** and set it accordingly, or let AQE — the next item — handle it.
 
 **Adaptive Query Execution (AQE)**, on by default in Spark 3 and later, and a genuine improvement rather than a marketing feature. It re-optimises the plan *at runtime* using real statistics gathered from completed stages. Specifically it coalesces small shuffle partitions after the fact, switches a sort-merge join to a broadcast join when a side turns out to be smaller than expected, and — the best part — **detects and splits skewed partitions automatically**. Leave it on.
 

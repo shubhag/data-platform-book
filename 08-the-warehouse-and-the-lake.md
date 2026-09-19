@@ -283,9 +283,9 @@ CREATE TABLE gold.search_events (
 );
 ```
 
-Two hundred columns is fine — a query reading four of them pays for four. This is the "one big table" pattern, and for BI dashboards it is often the fastest and least error-prone thing you can build, because there are no joins to get wrong. The cost is that when a document's title changes, you rewrite it in the fact table rather than in one dimension row, which is a job you now own.
+Two hundred columns is fine — a query reading four of them pays for four. This is the "one big table" pattern, and for BI dashboards — business intelligence, meaning the reporting and charting tools analysts point at your tables — it is often the fastest and least error-prone thing you can build, because there are no joins to get wrong. The cost is that when a document's title changes, you rewrite it in the fact table rather than in one dimension row, which is a job you now own.
 
-Rule of thumb: model **silver** as a proper star (it is the reusable layer), and materialize **gold** as wide tables shaped for specific consumers. Which brings us, finally, to where those layers live.
+Rule of thumb: model **silver** as a proper star (it is the reusable layer), and materialize **gold** as wide tables shaped for specific consumers. Those two names are the middle and last of the three medallion layers introduced in §4.2 and covered fully in §8.8; for now, read silver as "cleaned and trustworthy" and gold as "shaped for one consumer". Which brings us, finally, to where those layers live.
 
 ## 8.5 Warehouse, lake, lakehouse
 
@@ -379,7 +379,7 @@ Three things to notice, because each one explains a family of features.
 
 **Atomicity.** The writer writes its Parquet files first — invisible, because no one has added them — and then makes a single atomic write of `00000000000000000003.json`. Either that file exists or it doesn't. A job that dies after writing 300 of 500 data files leaves 300 orphans and no commit; readers see nothing changed. Compare that to the lake's half-written table.
 
-**Snapshot isolation.** A reader resolves the log once, at version 7, and reads those files for the duration of its query. A writer committing version 8 removes files from the *table*, but does not delete them from storage — so the reader's files are still there. Readers never block writers, writers never block readers, and nobody sees a partial result. Exactly the MVCC idea from a transactional database, implemented with a list of filenames.
+**Snapshot isolation.** A reader resolves the log once, at version 7, and reads those files for the duration of its query. A writer committing version 8 removes files from the *table*, but does not delete them from storage — so the reader's files are still there. Readers never block writers, writers never block readers, and nobody sees a partial result. Exactly the MVCC idea — multi-version concurrency control, where a reader sees a consistent version of the data while writers create new ones — implemented here with nothing more than a list of filenames.
 
 **Optimistic concurrency for writers.** Two jobs both read version 7 and both try to commit version 8. The commit is an atomic put-if-absent, so one wins. The loser re-reads the log, checks whether the winner's changes conflict with its own (did they touch overlapping files? overlapping partitions?), and if not, retries as version 9. Two jobs appending to different partitions never conflict. Two jobs updating the same rows do, and the second one fails with `ConcurrentAppendException` — which is a correct failure, not a bug.
 
@@ -443,7 +443,7 @@ OPTIMIZE silver.documents;                          -- compact into ~1 GB files
 OPTIMIZE silver.documents ZORDER BY (owner_team_id, updated_at);
 ```
 
-`ZORDER` is the clustering from §8.3 trick 2: it sorts rows by a space-filling curve over the named columns, so rows with similar `owner_team_id` land in the same file, so min/max skipping actually skips. Use it on the 1–3 columns your queries filter on most. Newer Databricks offers **liquid clustering** (`CLUSTER BY`), which does the same job incrementally and lets you change the clustering keys later without rewriting the table — prefer it when available, because "we chose the wrong Z-order columns and now cannot change them" is a real and annoying situation.
+`ZORDER` is the clustering from §8.3 trick 2: it sorts rows by a space-filling curve over the named columns — a curve that visits every point in a multi-column space while keeping nearby points close together, which is how it clusters on two or three columns at once rather than just the first — so rows with similar `owner_team_id` land in the same file, so min/max skipping actually skips. Use it on the 1–3 columns your queries filter on most. Newer Databricks offers **liquid clustering** (`CLUSTER BY`), which does the same job incrementally and lets you change the clustering keys later without rewriting the table — prefer it when available, because "we chose the wrong Z-order columns and now cannot change them" is a real and annoying situation.
 
 **`VACUUM` — because old versions cost money.** Removed files stay on storage so time travel works. Eventually you must delete them.
 

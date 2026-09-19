@@ -244,21 +244,33 @@ Terms are grouped by where they first matter, with a section reference to the fu
 
 **Checkpoint** — An automatic, periodic, globally consistent snapshot for failure recovery. §6.4
 
+**Dataflow / job** — The graph of operators you submit to a cluster, running until stopped. §6.2
+
 **Event time** — When something happened in the world. The basis of reproducible results. §6.5
+
+**Forwarding vs. redistribution** — Records staying in the same slot (free) vs. crossing the network to the subtask owning a key (a shuffle). §6.2
 
 **Incremental checkpoint** — Shipping only changed RocksDB files rather than the full state. §6.4
 
 **Keyed state** — State scoped per key, with Flink swapping the context per record. §6.3
 
+**Operator** — One processing step in a streaming pipeline: records in, one thing done to each, records out. A source has no input inside the job, a sink no output, everything between is a transformation. §6.2
+
+**Parallelism / subtask** — How many identical copies of an operator run at once; each copy is a subtask handling a slice of the records. §6.2
+
 **Processing time** — When an operator handled a record. Low latency, non-reproducible. §6.5
 
 **Savepoint** — A manually triggered snapshot for upgrades, rescaling, and rollback. Requires stable operator UIDs. §6.4
+
+**Session vs. application mode** — One long-lived Flink cluster hosting many jobs, versus a dedicated cluster per job. Use application mode in production. §6.8
 
 **Session window** — A window defined by a gap of inactivity; windows merge as events fill gaps. §6.6
 
 **Side output** — A secondary output stream, typically for late or invalid records. §6.5
 
 **State TTL** — Time-to-live on state, one of only three acceptable answers to "what bounds this state?". §6.3
+
+**Task slot** — One share of a TaskManager's memory and threads; a subtask runs in a slot, and fused subtasks share one. §6.2
 
 **Temporal join** — Joining against the version of a dimension as of the event's own time. Point-in-time correctness. §6.6
 
@@ -282,6 +294,10 @@ Terms are grouped by where they first matter, with a section reference to the fu
 
 **Catalyst** — Spark's query optimizer. The reason DataFrames beat RDDs. §7.2
 
+**DAG** — Directed acyclic graph: the stages of a job, arrows pointing one way and never looping. §7.2
+
+**DataFrame / Dataset** — A distributed table with named, typed columns, described declaratively so Catalyst can optimise it. A Dataset is its compile-time-typed Scala/Java variant. §7.2
+
 **Driver / executor** — The coordinating process and the worker JVMs. §7.2
 
 **`foreachBatch`** — Access to each micro-batch as a batch DataFrame plus a `batch_id`. The escape hatch. §7.4
@@ -294,11 +310,15 @@ Terms are grouped by where they first matter, with a section reference to the fu
 
 **Output mode** — `append`, `update`, or `complete`. What gets emitted each batch. §7.4
 
+**RDD** — Resilient Distributed Dataset: Spark's original API, a distributed collection transformed by opaque functions. Avoid it — the optimiser cannot see inside a lambda. §7.2
+
 **Salting** — Adding a random suffix to a hot key and aggregating in two phases, to defeat skew. §7.2
 
 **Shuffle** — All-to-all redistribution of data between stages. The dominant cost in most Spark jobs. §7.2
 
 **`spark.sql.shuffle.partitions`** — Post-shuffle partition count, defaulting to a usually-wrong 200. §7.2
+
+**SparkSession** — The object your program uses to talk to the cluster; `spark` in a notebook. §7.2
 
 **State store** — Where streaming state lives. Use RocksDB for anything substantial. §7.5
 

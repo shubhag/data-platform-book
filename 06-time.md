@@ -139,7 +139,9 @@ Every interesting streaming computation is stateful, and state is what makes str
 
 The important kind. After a `keyBy(document_id)`, Flink partitions the keyspace across the operator's parallel subtasks, so each subtask owns a disjoint set of keys. State is then scoped **per key**, automatically.
 
-This is worth appreciating, because it removes an entire category of concurrency problem. Inside your function you write what looks like single-threaded code accessing a single variable:
+This is worth appreciating, because it removes an entire category of concurrency problem. Inside your function you write what looks like single-threaded code accessing a single variable.
+
+The snippet below is a **`KeyedProcessFunction`** — a class you write and hand to a `keyBy`-ed stream, and the most general way to express a stateful operator. Two methods matter: `open()` runs once when the subtask starts, and is where you register the state you intend to use; `processElement()` runs once per arriving record. `ValueState<Long>` is the registered state handle, and `Collector` is how you emit output.
 
 ```java
 public class ViewCounter extends KeyedProcessFunction<String, View, Long> {
@@ -172,7 +174,7 @@ There is also **operator state**, scoped per subtask rather than per key, which 
 
 **HashMapStateBackend** keeps state as Java objects on the JVM heap. Fastest possible access, and bounded by your heap, with all the garbage collection consequences that implies at scale.
 
-**EmbeddedRocksDBStateBackend** keeps state in an embedded RocksDB instance on local disk, serialized. Access is slower — you pay serialization and possibly a disk read — but state can be **far larger than memory**, into the terabytes, and it supports **incremental checkpoints**, which §6.4 will show is a large operational advantage.
+**EmbeddedRocksDBStateBackend** keeps state in an embedded RocksDB instance on local disk, serialized. **RocksDB** is an embedded key-value store — a library, not a server — that Flink runs inside the TaskManager process; it stores sorted key-value pairs in immutable files on disk with an in-memory cache in front, which is why it can hold far more than the heap and why its files can be copied incrementally. Access is slower — you pay serialization and possibly a disk read — but state can be **far larger than memory**, into the terabytes, and it supports **incremental checkpoints**, which §6.4 will show is a large operational advantage.
 
 For anything with substantial, long-lived state, use RocksDB. The access cost is real but rarely the bottleneck, and the alternative is a job that works in testing and dies in production when the keyspace grows.
 
@@ -250,7 +252,7 @@ The interval is a **recovery-time versus overhead** trade-off, and it is worth t
 
 A useful rule: **if checkpoint duration approaches the checkpoint interval, the job is in trouble.** The checkpoints are not keeping up, and the cause is almost always either backpressure (fix the bottleneck operator) or state that has grown beyond what can be snapshotted in the time available (fix the TTL). Checkpoint duration creeping upward over weeks is the clearest early warning signal Flink gives you, and it is worth an alert.
 
-With RocksDB you also get **incremental checkpoints**, which ship only the SST files that changed since the last checkpoint rather than the whole state. On a five-hundred-gigabyte state where a few gigabytes change per minute, this is the difference between a viable job and an impossible one.
+With RocksDB you also get **incremental checkpoints**, which ship only the SST files (RocksDB's immutable on-disk data files) that changed since the last checkpoint, rather than the whole state. On a five-hundred-gigabyte state where a few gigabytes change per minute, this is the difference between a viable job and an impossible one.
 
 ### Savepoints, which are for you rather than for failures
 
@@ -478,6 +480,22 @@ The practical consequence is that your **sink must support upserts** — `upsert
 My recommendation: **express what you can in SQL, and drop to DataStream or ProcessFunction only for logic that genuinely doesn't fit.** Less code, fewer bugs, and a planner that will often do better than you would by hand.
 
 ## 6.8 Operating it
+
+### How a job actually gets deployed
+
+Worth stating plainly, because the chapter has so far described what a job *is* without saying how it comes to be running.
+
+You compile your job into a JAR (or a Python file, or a SQL script), and you submit it to a cluster:
+
+```
+flink run -d -c com.lantern.TrendingJob trending.jar
+```
+
+The JobManager receives the dataflow, asks the cluster manager for TaskManagers, places the subtasks in slots, and starts them. From then on the job runs until it fails or you stop it. `flink stop --savepointPath ...` stops it *and* takes a savepoint, which is how you deploy a new version: stop with a savepoint, submit the new JAR with `--fromSavepoint`, and the state carries over (§6.4).
+
+There are two deployment shapes and the difference matters operationally. In **session mode** one long-lived cluster hosts many jobs, which is cheap and convenient and means one job's failure can disturb its neighbours. In **application mode** each job gets its own cluster, dedicated and isolated, which is what you want for anything in production. On Kubernetes the Flink Operator does this for you, and a job becomes a custom resource you deploy like any other workload.
+
+Flink SQL has a third route: a SQL script submitted through the SQL client or a gateway, which the planner compiles into exactly the same dataflow of operators. Nothing below the SQL is different.
 
 ### The metrics that matter
 
