@@ -24,7 +24,57 @@ This is the problem Apache Flink is built around, and it is why this chapter is 
 
 The one-line positioning, which is worth holding onto as we go: where Spark Streaming is *batch, repeated very quickly* (Chapter 7), Flink is *streaming, with batch treated as the special case of a stream that happens to end.*
 
-### The shape of a running job
+### Operators: the one word you need first
+
+Nearly everything in the rest of this chapter is said in terms of **operators**, so let us build the word from something concrete before anything else.
+
+Go back to Lantern's trending panel. Written out as steps, the work is:
+
+1. read view events from the `document-views` Kafka topic;
+2. throw away the ones from internal test accounts;
+3. group the survivors by document ID;
+4. for each document, count the views falling in each five-minute window;
+5. write each count to OpenSearch.
+
+Each of those five steps is an **operator**. An operator is one processing step in a streaming pipeline: it takes records in, does one thing to each, and passes records out. That is the entire definition. If you have written `map` and `filter` over a list, you already have the idea; an operator is the same thing, except the list never ends and the step runs as a long-lived piece of a distributed program rather than as a loop.
+
+Operators come in three flavours, and the vocabulary is worth fixing now because the chapter uses it constantly:
+
+A **source** is an operator with no input inside the job — it pulls records in from the outside world. Step 1 is a source: a Kafka source.
+
+A **sink** is an operator with no output inside the job — it pushes records out to the outside world. Step 5 is a sink: an OpenSearch sink.
+
+Everything in between is a **transformation**: `filter` (step 2), `keyBy` (step 3), `window` plus an aggregate (step 4), and the familiar `map`, `flatMap`, `join`, and so on. Two of those deserve a word right now, because they appear in examples before their own sections. **`keyBy(document_id)`** does not compute anything; it declares "from here on, records are grouped by document ID", which is what lets the next operator keep a separate count per document (§6.3). **`window`** slices each of those per-key groups into five-minute buckets (§6.5).
+
+A **job** is those operators wired together into a graph — a **dataflow** — with records flowing along the edges:
+
+```
+  Kafka source ──▶ filter ──▶ keyBy ──▶ window+count ──▶ OpenSearch sink
+```
+
+That graph is the unit you submit to a cluster, and it runs until you stop it. When the chapter says "the sink is slow", "give every operator a UID", or "Flink's UI shows backpressure per operator", it means one of those boxes.
+
+### From one box to many machines
+
+An operator is a logical step. On a cluster, each one actually runs as several identical copies working on different records simultaneously.
+
+The number of copies is that operator's **parallelism**, and each copy is a **subtask**. A `filter` with a parallelism of eight is eight subtasks, each filtering roughly an eighth of the records, none of them aware of the others. Parallelism is set per operator: the source might run at twenty-four (one subtask per Kafka partition), the window at eight, the sink at four.
+
+So the picture above, drawn honestly for a parallelism of three, is this:
+
+```
+   source-1 ──▶ filter-1 ──┐        ┌──▶ window-1 ──▶ sink-1
+                           │        │
+   source-2 ──▶ filter-2 ──┼─keyBy──┼──▶ window-2 ──▶ sink-2
+                           │        │
+   source-3 ──▶ filter-3 ──┘        └──▶ window-3 ──▶ sink-3
+```
+
+Note what `keyBy` does in that picture: every filter subtask may hold records for any document, but each window subtask must see *all* records for the documents it owns, or its counts would be split across machines. So records cross between subtasks there. That crossing is the expensive part of streaming, and it has a name in the next subsection.
+
+### The two processes that run it
+
+Only now does the cluster itself matter, and it is two kinds of process:
 
 ```
         ┌───────────────────────────────────────────┐
@@ -44,9 +94,19 @@ The one-line positioning, which is worth holding onto as we go: where Spark Stre
    └─────────┘  └─────────┘     └─────────┘   └─────────┘
 ```
 
-A **job** is a graph of **operators**: source → map → keyBy → window → sink. Each operator runs with a configured **parallelism**, meaning N parallel **subtasks**, each handling a slice of the data. The **JobManager** coordinates; the **TaskManagers** execute. A **task slot** is a unit of resource on a TaskManager, and operators that can be fused together run in the same slot so that records pass between them as direct method calls rather than through serialization and a network buffer.
+The **JobManager** is the coordinator. It takes your submitted dataflow, decides how many subtasks go where, triggers checkpoints (§6.4), and restarts things after a failure. One per job, and you make it highly available with ZooKeeper or Kubernetes because it is a single point of failure otherwise.
 
-Data moves between operators in one of two ways, and the distinction is the same one Spark will call narrow versus wide (§7.1). **Forwarding** keeps a record in the same slot: free. **Redistribution** — which is what a `keyBy` or a `rebalance` causes — sends records across the network to whichever subtask owns the relevant key, with serialization on one end and deserialization on the other. Redistribution is where the cost is, and a dataflow with four `keyBy` operations in a row is doing four network shuffles you may not have intended.
+The **TaskManagers** are the workers. Each is a JVM process on some machine, and each offers a fixed number of **task slots** — a slot being one share of that worker's memory and threads. A subtask runs in a slot. Twenty-four subtasks need twenty-four slots somewhere in the cluster, and if the cluster has twenty, the job will not start.
+
+One detail that pays off later: consecutive subtasks that do not need records to cross machines are **fused** into the same slot, so `source-1 → filter-1` becomes a single chain in which a record passes from one to the next as a plain method call, with no serialization and no network. This is why the UI often shows fewer boxes than you wrote.
+
+### Forwarding versus redistribution
+
+Between two operators, records move in one of two ways, and the distinction is the same one Spark will call narrow versus wide (§7.1).
+
+**Forwarding** keeps a record in the same slot — `filter-1` hands to the operator fused after it. This is free.
+
+**Redistribution** sends records across the network to whichever subtask owns the relevant key, with serialization on one end and deserialization on the other. A `keyBy` causes it, as does an explicit `rebalance`. This is the record-crossing in the diagram above, and it is where nearly all the cost is. A dataflow with four `keyBy` operations in a row is doing four network shuffles you may not have intended.
 
 ### Backpressure, handled properly
 
