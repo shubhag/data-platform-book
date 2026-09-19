@@ -36,15 +36,9 @@ Go back to Lantern's trending panel. Written out as steps, the work is:
 4. for each document, count the views falling in each five-minute window;
 5. write each count to OpenSearch.
 
-Each of those five steps is an **operator**. An operator is one processing step in a streaming pipeline: it takes records in, does one thing to each, and passes records out. That is the entire definition. If you have written `map` and `filter` over a list, you already have the idea; an operator is the same thing, except the list never ends and the step runs as a long-lived piece of a distributed program rather than as a loop.
+Each of those five steps is an **operator**: one processing step that takes records in, does one thing to each, and passes records out. That is the entire definition. If you have written `map` and `filter` over a list you already have the idea, except the list never ends and the step runs as a long-lived piece of a distributed program rather than as a loop.
 
-Operators come in three flavours, and the vocabulary is worth fixing now because the chapter uses it constantly:
-
-A **source** is an operator with no input inside the job — it pulls records in from the outside world. Step 1 is a source: a Kafka source.
-
-A **sink** is an operator with no output inside the job — it pushes records out to the outside world. Step 5 is a sink: an OpenSearch sink.
-
-Everything in between is a **transformation**: `filter` (step 2), `keyBy` (step 3), `window` plus an aggregate (step 4), and the familiar `map`, `flatMap`, `join`, and so on. Two of those deserve a word right now, because they appear in examples before their own sections. **`keyBy(document_id)`** does not compute anything; it declares "from here on, records are grouped by document ID", which is what lets the next operator keep a separate count per document (§6.3). **`window`** slices each of those per-key groups into five-minute buckets (§6.5).
+Three flavours, and the vocabulary matters because the chapter uses it constantly. A **source** has no input inside the job — it pulls records in from the outside world, like step 1's Kafka source. A **sink** has no output inside the job — it pushes records out, like step 5's OpenSearch sink. Everything between is a **transformation**: `filter` (step 2), `keyBy` (step 3), `window` plus an aggregate (step 4), and the familiar `map`, `flatMap`, `join`. Two of those deserve a word right now, because they appear in examples before their own sections. **`keyBy(document_id)`** does not compute anything; it declares "from here on, records are grouped by document ID", which is what lets the next operator keep a separate count per document (§6.3). **`window`** slices each of those per-key groups into five-minute buckets (§6.5).
 
 A **job** is those operators wired together into a graph — a **dataflow** — with records flowing along the edges:
 
@@ -56,11 +50,9 @@ That graph is the unit you submit to a cluster, and it runs until you stop it. W
 
 ### From one box to many machines
 
-An operator is a logical step. On a cluster, each one actually runs as several identical copies working on different records simultaneously.
+An operator is a logical step; on a cluster each one runs as several identical copies working on different records at once. The number of copies is its **parallelism** and each copy is a **subtask**. A `filter` with a parallelism of eight is eight subtasks, each handling roughly an eighth of the records, none aware of the others. It is set per operator: the source might run at twenty-four (one subtask per Kafka partition), the window at eight, the sink at four.
 
-The number of copies is that operator's **parallelism**, and each copy is a **subtask**. A `filter` with a parallelism of eight is eight subtasks, each filtering roughly an eighth of the records, none of them aware of the others. Parallelism is set per operator: the source might run at twenty-four (one subtask per Kafka partition), the window at eight, the sink at four.
-
-So the picture above, drawn honestly for a parallelism of three, is this:
+Drawn honestly for a parallelism of three:
 
 ```
    source-1 ──▶ filter-1 ──┐        ┌──▶ window-1 ──▶ sink-1
@@ -94,11 +86,11 @@ Only now does the cluster itself matter, and it is two kinds of process:
    └─────────┘  └─────────┘     └─────────┘   └─────────┘
 ```
 
-The **JobManager** is the coordinator. It takes your submitted dataflow, decides how many subtasks go where, triggers checkpoints (§6.4), and restarts things after a failure. One per job, and you make it highly available with ZooKeeper or Kubernetes because it is a single point of failure otherwise.
+The **JobManager** is the coordinator: it takes your dataflow, decides which subtasks go where, triggers checkpoints (§6.4), and restarts things after a failure. One per job, made highly available with ZooKeeper or Kubernetes because it is otherwise a single point of failure.
 
-The **TaskManagers** are the workers. Each is a JVM process on some machine, and each offers a fixed number of **task slots** — a slot being one share of that worker's memory and threads. A subtask runs in a slot. Twenty-four subtasks need twenty-four slots somewhere in the cluster, and if the cluster has twenty, the job will not start.
+The **TaskManagers** are the workers — a JVM process per machine, each offering a fixed number of **task slots**, a slot being one share of that worker's memory and threads. A subtask runs in a slot, so twenty-four subtasks need twenty-four slots somewhere in the cluster; with twenty, the job will not start.
 
-One detail that pays off later: consecutive subtasks that do not need records to cross machines are **fused** into the same slot, so `source-1 → filter-1` becomes a single chain in which a record passes from one to the next as a plain method call, with no serialization and no network. This is why the UI often shows fewer boxes than you wrote.
+One detail that pays off later: consecutive subtasks that need no record to cross machines are **fused** into one slot, so `source-1 → filter-1` becomes a single chain passing records as plain method calls, with no serialization and no network. This is why the UI often shows fewer boxes than you wrote.
 
 ### Forwarding versus redistribution
 
@@ -139,20 +131,9 @@ SELECT document_id, COUNT(*) FROM TABLE(TUMBLE(TABLE views, DESCRIPTOR(ts), INTE
 GROUP BY window_start, document_id;
 ```
 
-**Table API** — the same engine, expressed as method chains.
+**Table API** — the same engine as method chains: `views.window(Tumble.over(...)).groupBy(...).select(...)`.
 
-```java
-views.window(Tumble.over(lit(5).minutes()).on($("ts")).as("w"))
-     .groupBy($("w"), $("document_id")).select($("document_id"), $("*").count());
-```
-
-**DataStream API** — imperative operator-by-operator construction. Full control.
-
-```java
-views.keyBy(v -> v.documentId)
-     .window(TumblingEventTimeWindows.of(Time.minutes(5)))
-     .aggregate(new CountAggregate());
-```
+**DataStream API** — imperative, operator by operator: `views.keyBy(v -> v.documentId).window(...).aggregate(new CountAggregate())`. Full control.
 
 **ProcessFunction** — raw access to state, timers, and side outputs. Where you go when the built-ins genuinely don't fit: "emit an alert the first time a document is viewed by someone outside its owning team, then stay silent for 24 hours" is a rule no window expresses, and a `KeyedProcessFunction` with a `ValueState` and a timer expresses it in twenty lines.
 
@@ -176,7 +157,7 @@ The important kind. After a `keyBy(document_id)`, Flink partitions the keyspace 
 
 This is worth appreciating, because it removes an entire category of concurrency problem. Inside your function you write what looks like single-threaded code accessing a single variable.
 
-The snippet below is a **`KeyedProcessFunction`** — a class you write and hand to a `keyBy`-ed stream, and the most general way to express a stateful operator. Two methods matter: `open()` runs once when the subtask starts, and is where you register the state you intend to use; `processElement()` runs once per arriving record. `ValueState<Long>` is the registered state handle, and `Collector` is how you emit output.
+The snippet below is a **`KeyedProcessFunction`**, the most general way to express a stateful operator. Two methods matter: `open()` runs once when the subtask starts and registers the state you intend to use; `processElement()` runs once per record. `ValueState<Long>` is the state handle, `Collector` emits output.
 
 ```java
 public class ViewCounter extends KeyedProcessFunction<String, View, Long> {
@@ -209,18 +190,9 @@ Watch it happen. Five records arrive at one subtask, interleaved across three do
 | 4 | `doc_40, dave`  | `doc_40` | `null` → 0 | `doc_40 → 1` | 1 |
 | 5 | `doc_88, erin`  | `doc_88` | **2** | `doc_88 → 3` | 3 |
 
-One variable in your code, one line of `count.update(n)`, three independent counters in the state backend:
+Record 3 read `1` and record 5 read `2` from the *same* Java field, because between records Flink swapped which key's slot that field points at — leaving three independent counters (`doc_88 → 3`, `doc_12 → 1`, `doc_40 → 1`) behind one variable. Notice also what the table does not contain: any record for a document owned by another subtask. `keyBy` guaranteed `doc_88` always lands here, which is what makes "the count for `doc_88`" a complete answer rather than a partial one needing combination later.
 
-```
-subtask 2's keyed state
-  doc_88 → 3
-  doc_12 → 1
-  doc_40 → 1
-```
-
-Record 3 read `1` and record 5 read `2` from the *same* Java field, because between records Flink swapped which key's slot that field points at. Notice also what the table does not contain: any record for a document belonging to another subtask. `keyBy` guaranteed `doc_88` always lands here, which is what makes "the count for `doc_88`" a complete answer rather than a partial one that needs combining later.
-
-There is also **operator state**, scoped per subtask rather than per key, which appears mostly inside connectors — a Kafka source remembering its offsets, for example. You will rarely write it yourself.
+There is also **operator state**, scoped per subtask rather than per key, which appears mostly inside connectors — a Kafka source remembering its offsets. You will rarely write it yourself.
 
 ### The primitives
 
@@ -234,23 +206,14 @@ Five state types, each with a job it is right for:
 | `ReducingState<T>` | one value, folded on write | the same count, but the fold is `(a,b) -> a+b` |
 | `AggregatingState<I,O>` | one accumulator, folded on write | a HyperLogLog sketch of unique viewers |
 
-The last two deserve the emphasis, because choosing wrongly between `ListState` and `ReducingState` is how a job dies slowly.
-
-Suppose you want the average view latency per document. The obvious implementation appends every latency to a `ListState` and averages when asked. For a document viewed a million times, that is a million longs — 8 MB of state, **for one key**, growing forever.
+The last two deserve emphasis, because choosing wrongly here is how a job dies slowly. Suppose you want the average view latency per document. The obvious implementation appends every latency to a `ListState` and averages when asked — for a document viewed a million times, a million longs, **8 MB of state for one key**, growing forever. The same answer needs two numbers folded on each write:
 
 ```java
-// unbounded: 8 MB and climbing for one popular document
-ListState<Long> latencies;
+ListState<Long> latencies;                   // 8 MB and climbing, for one document
+AggregatingState<Long, Double> avgLatency;   // 16 bytes per key, forever: (sum, count)
 ```
 
-The same answer needs exactly two numbers, a sum and a count, folded on each write:
-
-```java
-// bounded: 16 bytes per key, forever
-AggregatingState<Long, Double> avgLatency;   // accumulator = (sum, count)
-```
-
-Sixteen bytes versus eight megabytes, for identical output. Across two hundred million documents, that is the difference between 3 GB of state and a job that cannot checkpoint. **When you have a choice, aggregate on write.**
+Identical output. Across two hundred million documents, that is the difference between 3 GB of state and a job that cannot checkpoint. **When you have a choice, aggregate on write.**
 
 ### Where state lives
 
@@ -258,18 +221,9 @@ Sixteen bytes versus eight megabytes, for identical output. Across two hundred m
 
 **EmbeddedRocksDBStateBackend** keeps state in an embedded RocksDB instance on local disk, serialized. **RocksDB** is an embedded key-value store — a library, not a server — that Flink runs inside the TaskManager process; it stores sorted key-value pairs in immutable files on disk with an in-memory cache in front, which is why it can hold far more than the heap and why its files can be copied incrementally. Access is slower — you pay serialization and possibly a disk read — but state can be **far larger than memory**, into the terabytes, and it supports **incremental checkpoints**, which §6.4 will show is a large operational advantage.
 
-The choice is usually decided by one multiplication. Lantern keys by `document_id`, there are two hundred million documents, and each one's state is a count plus a HyperLogLog sketch — call it 300 bytes.
+The choice is decided by one multiplication. Lantern keys by `document_id`: 200 million documents × 300 bytes of state each = **60 GB**, or 3 GB per TaskManager across twenty. Three gigabytes of live Java objects per JVM, permanently, is a heap that spends its life in garbage collection; the same 3 GB in RocksDB is a few files on local disk with a cache in front. So: RocksDB. Had the job keyed by `country` — two hundred keys, a few kilobytes — HashMap would be obvious and RocksDB's serialization pure waste.
 
-```
-200,000,000 keys × 300 bytes = 60 GB of state
-spread over 20 TaskManagers  = 3 GB per TaskManager
-```
-
-Three gigabytes of live Java objects per JVM, permanently, is a heap that spends its life in garbage collection. The same 3 GB in RocksDB is a few files on local disk with a cache in front, and the JVM heap stays small. So: RocksDB.
-
-Had the job keyed by `country` instead — two hundred keys, a few kilobytes total — HashMap would be the obvious answer, and RocksDB's serialization cost would be pure waste.
-
-The rule that falls out: **estimate keys × bytes-per-key before choosing.** Under a gigabyte, use the heap. Above it, use RocksDB. The access cost is real but rarely the bottleneck, and the alternative is a job that works in testing and dies in production when the keyspace grows.
+**Estimate keys × bytes-per-key before choosing.** Under a gigabyte, use the heap. Above it, use RocksDB. The access cost is real but rarely the bottleneck, and the alternative is a job that works in testing and dies in production when the keyspace grows.
 
 In both cases, checkpoints are written to durable external storage — S3, HDFS — not to the local disk.
 
@@ -296,14 +250,10 @@ Here is that job's actual trajectory, which is worth seeing as numbers because t
 | Week | Distinct keys | State | Checkpoint duration |
 |---|---|---|---|
 | 1 | 0.4 M | 120 MB | 3 s |
-| 4 | 1.6 M | 480 MB | 11 s |
 | 12 | 4.8 M | 1.4 GB | 34 s |
-| 26 | 10.4 M | 3.1 GB | 78 s |
 | 40 | 16 M | 4.8 GB | 140 s |
 
-Nothing ever breaks. No error is logged. Then one afternoon the checkpoint interval is 60 seconds and the checkpoint takes 140, checkpoints start overlapping and timing out, and — because a job that cannot checkpoint cannot recover — the first machine failure after that point replays from a checkpoint hours old.
-
-The document viewed once in 2019 and never again is still paying rent every sixty seconds. A seven-day TTL flattens that entire table: documents nobody has viewed in a week are dropped, the keyspace stabilises at roughly one week of activity, and week 40 looks exactly like week 4.
+Nothing ever breaks and no error is logged. Then one afternoon the checkpoint interval is 60 seconds and the checkpoint takes 140, checkpoints overlap and time out, and — because a job that cannot checkpoint cannot recover — the next machine failure replays from a checkpoint hours old. The document viewed once in 2019 is still paying rent every sixty seconds. A seven-day TTL flattens the whole table: the keyspace stabilises at one week of activity, and week 40 looks like week 1.
 
 ## 6.4 Checkpoints
 
@@ -348,13 +298,9 @@ checkpoint-41/
   state:    doc_88 → 1,000
 ```
 
-Read that pair carefully, because the entire mechanism is in it: **at the moment `doc_88`'s count was 1,000, the source had consumed exactly 8,300 records.** Neither number is meaningful alone; together they are a consistent position in the computation.
+Read that pair carefully, because the whole mechanism is in it: **at the moment `doc_88`'s count was 1,000, the source had consumed exactly 8,300 records.** Neither number means anything alone; together they are a consistent position in the computation.
 
-Processing continues. Between 10:00:00 and 10:00:47, offsets 8,301–8,500 are read, thirty of which are views of `doc_88`, and the count climbs to 1,030.
-
-At 10:00:47 the TaskManager holding `doc_88` is killed. Its memory is gone: the count of 1,030 no longer exists anywhere.
-
-Flink restarts the job, and does exactly two things:
+Processing continues. Offsets 8,301–8,500 are read, thirty of them views of `doc_88`, and the count climbs to 1,030. At 10:00:47 the TaskManager holding `doc_88` is killed, and that 1,030 no longer exists anywhere. Flink restarts and does exactly two things:
 
 ```
 1. restore state from checkpoint-41   →  doc_88 = 1,000
@@ -363,9 +309,9 @@ Flink restarts the job, and does exactly two things:
 
 Now offsets 8,301 onward are read a second time. The same thirty views of `doc_88` arrive again, in the same order, and the count walks back up 1,001, 1,002, … 1,030. By the time the job catches up to where it was, the count is 1,030 — **the same number it had before the crash**, not 1,060.
 
-The reason it is not 1,060 is the whole point: the state was rewound *with* the offsets. Had Flink restored the state but resumed from offset 8,500, the thirty views would have been lost and the count would read 1,000. Had it kept the in-memory count somehow but rewound to 8,300, they would have been counted twice, for 1,060. Exactly-once is not a guarantee that a record is delivered once; it is the guarantee that **state and input position always move together.**
+The reason it is not 1,060 is the whole point. Restore the state but resume at offset 8,500 and the thirty views are lost, for 1,000. Rewind to 8,300 while keeping the in-memory count and they are counted twice, for 1,060. Exactly-once is not a promise that a record is delivered once; it is the promise that **state and input position always move together.**
 
-One thing this does not promise: those thirty records were genuinely *processed* twice, and anything they did outside Flink — an HTTP call, a non-keyed insert — happened twice. That is what §6.4's discussion of sinks is about.
+What it does not promise: those thirty records genuinely *were* processed twice, so anything they did outside Flink happened twice. That is what the sink discussion below is about.
 
 ### Alignment, and how to avoid paying for it
 
@@ -378,9 +324,9 @@ input A:  ─ e12 ─ e11 ─ ║B42║ ─ e10 ─ e9 ──►   barrier arriv
 input B:  ─────── e8 ── e7 ─── e6 ── e5 ──►   barrier still 4 s upstream
 ```
 
-`e11` and `e12` arrived *after* barrier 42 on input A. If the operator processed them, its snapshot would include records from after the barrier on one input and before it on the other — not a single consistent moment, and on recovery those two inputs would be rewound to positions that no longer agree.
+`e11` and `e12` arrived *after* barrier 42 on input A. Processing them would put post-barrier records from one input and pre-barrier records from the other into the same snapshot — not a single consistent moment, and on recovery the two inputs would rewind to positions that no longer agree.
 
-So it holds `e11` and `e12` in a buffer and processes only input B until barrier 42 arrives there too, at 10:00:07. Then it snapshots, forwards the barrier, and drains the buffer. Those four seconds are **alignment time**, and it is four seconds in which input A is stalled — visible in the UI as `checkpointAlignmentTime`. Under backpressure, where one input might be a minute behind, it is a minute of stall every checkpoint.
+So the operator buffers them and processes only input B until barrier 42 arrives there too, at 10:00:07. Those four seconds are **alignment time** — four seconds in which input A is stalled, visible in the UI as `checkpointAlignmentTime`. Under backpressure, where one input may be a minute behind, it is a minute of stall every checkpoint.
 
 Under heavy backpressure that wait can be long, and since checkpoints must complete before the next one starts, slow alignment is a common reason checkpoints begin to fail. Two escapes:
 
@@ -419,24 +365,14 @@ stream.keyBy(...).process(new ViewCounter()).uid("view-counter");
 
 Flink matches state in a savepoint to operators by their ID. Without explicit UIDs, Flink generates them from the structure of the dataflow graph — so **adding a filter upstream changes the generated IDs of everything after it**, and the savepoint can no longer be restored.
 
-Here is that in practice, and it is worth reading closely because it happens at the worst possible moment. Monday's job, with no UIDs set, gets generated IDs:
+In practice, and it happens at the worst possible moment. Monday's job has no UIDs, so the counter's ID is a hash of the graph's shape, and the savepoint records `{ 0xb4e2… : 500 GB of counts }`. On Friday you add one line — a filter for test accounts — upstream of it:
 
 ```
-source → window+count → sink
-         id: 0xb4e2...   (derived from the graph's shape)
-savepoint written: { 0xb4e2... : 500 GB of counts }
+Monday:  source →          window+count → sink      id: 0xb4e2...
+Friday:  source → filter → window+count → sink      id: 0x7a91...   ← shape changed, hash changed
 ```
 
-On Friday you add one line — a filter for test accounts — upstream of the counter:
-
-```
-source → filter → window+count → sink
-                  id: 0x7a91...   (the shape changed, so the hash changed)
-```
-
-You restore from Friday's savepoint. Flink looks for state belonging to `0x7a91...`, finds none, and either fails with `Cannot map checkpoint/savepoint state` or — worse, if you passed `--allowNonRestoredState` to get past the error — starts the counter from **zero**. Three weeks of counts, gone, because of a one-line filter. The counter operator's *code* did not change at all; only its position in the graph did.
-
-With `.uid("view-counter")` set from day one, the ID is `view-counter` on Monday and `view-counter` on Friday, the filter is irrelevant, and the state restores.
+Restoring from the savepoint, Flink looks for state belonging to `0x7a91…`, finds none, and either fails with `Cannot map checkpoint/savepoint state` or — if you pass `--allowNonRestoredState` to get past the error — starts the counter from **zero**. Three weeks of counts gone because of a one-line filter, and the counter's *code* never changed; only its position in the graph did. With `.uid("view-counter")` set from day one the ID is `view-counter` in both, and the filter is irrelevant.
 
 Set `.uid()` on every stateful operator, from the first line of code, forever. It costs one method call and it is the difference between a job you can evolve and a job you can only restart from empty.
 
@@ -444,22 +380,16 @@ Set `.uid()` on every stateful operator, from the first line of code, forever. I
 
 Checkpoints give exactly-once **state**. For exactly-once **output** the sink must participate, and there are two ways.
 
-To see why the sink has to participate, return to the traced crash above: thirty views of `doc_88` were reprocessed. Flink's *state* handled that correctly, because it was rewound along with the offsets. But if the operator wrote to the sink as it went, those thirty writes were issued twice.
+Why the sink must participate is the traced crash again: those thirty views were reprocessed, so if the operator wrote as it went, thirty writes were issued twice and the sink holds two rows per view. Flink cannot fix that alone — it has no way to un-issue a write.
+
+**An idempotent sink.** Writes are keyed on something deterministic, so a replay overwrites rather than duplicates:
 
 ```
-before crash:  INSERT view(doc_88, carol, 10:04:11)   ← written
-after replay:  INSERT view(doc_88, carol, 10:04:11)   ← written AGAIN
+INSERT view(doc_88, carol, 10:04:11)        → two rows after a replay
+PUT /views/_doc/doc_88:carol:10:04:11       → same _id both times, one row
 ```
 
-The sink now holds two rows for one view. Flink cannot fix this alone; it has no way to un-issue a write it already made.
-
-**An idempotent sink.** Writes are keyed on something deterministic, so a replay overwrites rather than duplicates. Change the `INSERT` above into a write keyed by something derivable from the record itself:
-
-```
-PUT /views/_doc/doc_88:carol:1759312451000    ← same _id both times
-```
-
-The second write lands on the same document ID as the first and overwrites it. Two attempts, one row. This is Lantern's approach — OpenSearch with `_id = "{document_id}:{chunk_index}"` — and it is the fourth appearance of this pattern in the book. Simple, cheap, and sufficient. Note the requirement hiding in it: the ID must come from the *data*, never from a counter, a UUID, or the clock, because a replay must regenerate the identical value.
+This is Lantern's approach — OpenSearch with `_id = "{document_id}:{chunk_index}"` — and the fourth appearance of the pattern in the book. Note the requirement hiding in it: the ID must come from the *data*, never from a counter, a UUID, or the clock, because a replay must regenerate the identical value.
 
 **A transactional sink**, implementing two-phase commit. The sink opens a transaction, writes into it, **pre-commits** when the barrier passes (durably promising it can commit), and **commits when the checkpoint completes**. Kafka's transactional producer and Flink's file sinks work this way. The checkpoint acts as the transaction coordinator, which neatly sidesteps §1.7's objection to two-phase commit — the coordinator's state is itself checkpointed, so a coordinator failure is recoverable rather than a permanent block.
 
@@ -515,15 +445,15 @@ Read the table one row at a time. "Max seen" is the highest event time encounter
 | 8 | 10:05:31 | 10:05:31 | **10:05:01** | **watermark passes 10:05 → window 10:00–10:05 fires, emitting count = 5, and its state is freed** |
 | 9 | **10:04:20** | 10:05:31 | 10:05:01 | arrives after its window fired. Event time 10:04:20 < watermark 10:05:01: this record is **late** |
 
-Several things in that trace are worth naming.
+Four things in that trace are worth naming.
 
-**Rows 3 and 6 are the reason watermarks exist.** Both events arrived out of order, one by 25 seconds. A system with no grace at all — firing the moment it saw a record stamped past 10:05, which is record 5 — would have counted 4 and never seen record 6. The thirty-second grace is what caught it.
+**Rows 3 and 6 are why watermarks exist.** Both arrived out of order, one by 25 seconds. With no grace at all — firing the moment a record stamped past 10:05 appeared, which is record 5 — the count would be 4 and record 6 would never have been seen.
 
-**Row 8 is the firing rule, and note what triggered it.** The window did not fire because a clock struck 10:05. It fired because a *record* arrived — one stamped 10:05:31 — that dragged the watermark past the window's end. Watermarks advance on data, not on time. This has a direct consequence: **if no more records arrive, the window never fires.** A stream that goes quiet at 10:04:59 leaves that window open indefinitely, holding its state, emitting nothing. That is not a bug; it is the promise working as written, and it is the seed of the trap two subsections below.
+**Row 8 is the firing rule.** The window did not fire because a clock struck 10:05; it fired because a *record* stamped 10:05:31 dragged the watermark past the window's end. Watermarks advance on data, not on time — so **if no more records arrive, the window never fires.** A stream that goes quiet at 10:04:59 leaves it open indefinitely, holding state and emitting nothing. That is the promise working as written, and the seed of the trap two subsections below.
 
-**Row 9 is the cost of the promise.** The generator asserted "nothing before 10:05:01 will arrive", and then something did. The assertion was wrong — and it will sometimes be wrong no matter what number you pick, because §6.1 established that no duration is both correct and prompt. What you get to choose is how often it is wrong and what happens when it is.
+**Row 9 is the cost of the promise.** The generator asserted "nothing before 10:05:01 will arrive" and something did. It will sometimes be wrong whatever number you pick, because §6.1 established no duration is both correct and prompt; what you choose is how often, and what happens then.
 
-**And the whole table is reproducible.** Re-run this input tomorrow on a differently-loaded cluster and every row is identical, because nothing here consulted the wall clock. That is the property §6.1 said processing time could not give you.
+**And the table is reproducible.** Re-run this input tomorrow on a differently-loaded cluster and every row is identical, because nothing here consulted the wall clock — the property §6.1 said processing time could not give you.
 ### Generating them
 
 The standard generator says: assume events may be out of order by up to a bounded amount.
@@ -552,21 +482,7 @@ Take the same nine events and turn the dial, to see that this is not a small eff
 
 Three different answers to "how many people viewed this document between 10:00 and 10:05", from identical input, differing only in one configured duration. There is no setting that is simply correct — the 0-second job is fast and wrong, the 5-minute job is right and five minutes stale — and pretending otherwise is how teams end up with a dashboard nobody can reconcile.
 
-Choose it from data rather than intuition. Measure the distribution of `processing_time − event_time` across your actual stream and pick something near the p99:
-
-```sql
--- run this against a sample of the topic before you pick a number
-SELECT
-  percentile(delay_ms, 0.50) AS p50,
-  percentile(delay_ms, 0.99) AS p99,
-  percentile(delay_ms, 0.999) AS p999,
-  max(delay_ms)              AS worst
-FROM (SELECT kafka_ts - event_time AS delay_ms FROM document_views);
-```
-
-For Lantern that query returns p50 = 400 ms, p99 = 6 s, p999 = 22 s, max = 4 min (one laptop that had been asleep). Thirty seconds sits above p999 and below the pathological tail — generous, and cheap, because the panel refreshing 30 seconds behind is invisible to a user. The 4-minute laptop is deliberately abandoned; the alternative is delaying *every* window by four minutes to rescue one event.
-
-A pipeline fed by mobile clients would see p99 in the minutes and would have to accept ten-minute-old dashboards as the price. Same mechanism, different data, very different number.
+Choose it from data rather than intuition: measure `kafka_ts − event_time` across a sample of your actual stream and pick something past the p99. For Lantern that distribution is p50 = 400 ms, p99 = 6 s, p999 = 22 s, max = 4 min (one laptop that had been asleep). Thirty seconds sits above p999 and below the pathological tail — cheap, because a panel 30 seconds behind is invisible to a user, and the 4-minute laptop is deliberately abandoned rather than delaying *every* window by four minutes to rescue one event. A pipeline fed by mobile clients would see p99 in the minutes and would have to accept ten-minute-old dashboards as the price.
 
 ### The trap that catches everyone
 
@@ -588,9 +504,7 @@ partition 17  SILENT  watermark 09:15:02  ┘  ← last record at 09:15:32
 partition 23  busy    watermark 10:42:11
 ```
 
-Twenty-three partitions are convinced it is 10:42. One partition last saw a record at 09:15 and has had nothing to raise its watermark since. The operator can only promise what its least advanced input promises, so the job's watermark is **09:15:02** — an hour and a half in the past. Every window since 09:15 sits open, accumulating state, waiting for a watermark that will never come.
-
-That partition's watermark never advances. The minimum never advances. **No window anywhere in the job ever fires.**
+Twenty-three partitions are convinced it is 10:42. One last saw a record at 09:15 and has had nothing to raise its watermark since. The operator can only promise what its least advanced input promises, so the job's watermark is **09:15:02** — ninety minutes in the past. Every window since then sits open, accumulating state, waiting for a watermark that will never come. **No window anywhere in the job ever fires.**
 
 The symptom is maddening and completely specific: *the job is running, the metrics show records flowing in and being processed, no errors appear anywhere, and no output is ever produced.* Everything looks healthy. Nothing comes out.
 
@@ -628,14 +542,14 @@ My recommendation: **always take the side output, even if you only count what la
 
 Windows chop an infinite stream into finite pieces you can aggregate.
 
-**Tumbling** windows are fixed-size and non-overlapping. Every event belongs to exactly one.
+**Tumbling** — fixed-size, non-overlapping, every event in exactly one.
 
 ```
 [──10:00–10:05──][──10:05–10:10──][──10:10–10:15──]
 ```
 `TumblingEventTimeWindows.of(Time.minutes(5))` — Lantern's trending panel.
 
-**Sliding** windows are fixed-size with a shorter slide, so they overlap and each event belongs to `size / slide` of them.
+**Sliding** — fixed-size with a shorter slide, so they overlap and each event belongs to `size / slide` of them.
 
 ```
 [──10:00–10:05──]
@@ -644,9 +558,9 @@ Windows chop an infinite stream into finite pieces you can aggregate.
 ```
 `SlidingEventTimeWindows.of(Time.minutes(5), Time.minutes(1))` — a five-minute moving average refreshed every minute. Note the arithmetic before you deploy: size over slide is five, so **five times the state and five times the output** of the equivalent tumbling window. A one-hour window sliding every second is 3 600 copies of everything, and people do write that by accident.
 
-**Session** windows are defined by inactivity rather than by the clock: events group together until a gap of more than N minutes, then a new session starts. `EventTimeSessionWindows.withGap(Time.minutes(30))`. Naturally variable length, and they *merge* — an event arriving between two existing sessions joins them into one. Excellent for modelling user behaviour, and the hardest kind to bound in state, since a session has no predetermined end.
+**Session** — defined by inactivity rather than the clock: events group together until a gap of more than N minutes. `EventTimeSessionWindows.withGap(Time.minutes(30))`. Variable length, excellent for modelling user behaviour, and the hardest kind to bound in state since a session has no predetermined end.
 
-**Global** windows put everything in one window forever, with a custom trigger deciding when to fire. For count-based or condition-based windowing.
+**Global** — everything in one window forever, with a custom trigger deciding when to fire. For count- or condition-based windowing.
 
 ### The same events, four window types
 
@@ -659,52 +573,24 @@ The descriptions blur together until you see one input produce four different ou
    e1      e2           e3                       e4      e5
 ```
 
-**Tumbling, 5 minutes** — every event in exactly one bucket, buckets fixed to the clock:
-
-| Window | Events | Count |
+| | Windows emitted | Counts |
 |---|---|---|
-| 10:00–10:05 | e1, e2 | 2 |
-| 10:05–10:10 | e3 | 1 |
-| 10:40–10:45 | e4 | 1 |
-| 10:45–10:50 | e5 | 1 |
+| **Tumbling** 5 min | `10:00–10:05`, `10:05–10:10`, `10:40–10:45`, `10:45–10:50` | 2, 1, 1, 1 |
+| **Sliding** 5 min / 1 min | ~20 overlapping windows from `09:57–10:02` onward | e1 alone appears in five of them |
+| **Session** 30 min gap | `10:01–10:07`, `10:44–10:46` | 3, 2 |
+| **Global**, count trigger of 3 | fires once, at e3 | 3 |
 
-Total emitted rows: 4. Each event counted once. This is the trending panel.
+Four correct answers — 4 rows, ~20 rows, 2 rows, 1 row — from identical input, and each is worth a sentence.
 
-**Sliding, 5 minutes every 1 minute** — each event lands in five overlapping windows:
+**Tumbling** counts every event exactly once, so the counts sum to 5. This is the trending panel.
 
-| Window | Events | Count |
-|---|---|---|
-| 09:58–10:03 | e1, e2 | 2 |
-| 09:59–10:04 | e1, e2 | 2 |
-| 10:00–10:05 | e1, e2 | 2 |
-| 10:01–10:06 | e1, e2 | 2 |
-| 10:02–10:07 | e2 | 1 |
-| 10:03–10:08 | e3 | 1 |
-| … | | |
+**Sliding** counts every event *five* times, in five different rows, because `size / slide` = 5. That is right for a moving average and catastrophic if someone sums the column believing it is a total.
 
-Total emitted rows: around 20 for these five events. Every event was counted five times, in five different rows — which is correct for a moving average and catastrophic if you sum the column thinking you have a total. This is where the `size / slide` arithmetic becomes real.
+**Session** ignores the clock entirely: the boundaries came from the 37-minute silence between e3 and e4. Its state cannot be released until the gap has provably elapsed, which is why sessions are the hardest kind to bound. And they *merge* — a late record at 10:20 falls within 30 minutes of both, so Flink combines them into one session `10:01–10:46` with 6 events and retracts the two rows it already emitted.
 
-**Session, 30-minute gap** — no clock at all; the boundaries come from the data:
+**Global** ignores time completely; e4 and e5 sit in state until a sixth event arrives, whether that is in a minute or in a year.
 
-| Session | Events | Count |
-|---|---|---|
-| 10:01–10:07 | e1, e2, e3 | 3 |
-| 10:44–10:46 | e4, e5 | 2 |
-
-Two rows, because the 37-minute silence between e3 and e4 exceeded the gap. Note that the second session's boundary was not known until a record arrived after 10:46 + 30 min — session state cannot be released until the gap has provably elapsed, which is why sessions are the hardest kind to bound.
-
-And note the merge: if a late record for 10:20 arrived, it would be within 30 minutes of both sessions, so Flink would **merge them into one session 10:01–10:46 with 6 events**, retracting the two rows it had emitted.
-
-**Global, with a count trigger of 3** — fires on every third record, ignoring time entirely:
-
-| Fires at | Events | Count |
-|---|---|---|
-| e3 | e1, e2, e3 | 3 |
-| (waiting) | e4, e5 | — |
-
-One row so far, and e4 and e5 sit in state until a sixth event arrives, whether that is in a minute or in a year.
-
-Four correct answers — 4 rows, ~20 rows, 2 rows, 1 row — from the identical five events. **The window type is a modelling decision about what the question means**, not a performance setting, and choosing it by copying the nearest example is how a number ends up meaning something other than what its column header says.
+**The window type is a modelling decision about what the question means**, not a performance setting, and choosing it by copying the nearest example is how a number ends up meaning something other than what its column header says.
 
 ### Window functions, and one that will hurt you
 
@@ -739,16 +625,7 @@ For the 10:00–10:05 window, the default trigger emits one row, at 10:05:31 whe
 10:05:31   (10:00-10:05, doc_88, 5)   final
 ```
 
-An early trigger firing every minute emits six:
-
-```
-10:01:00   (10:00-10:05, doc_88, 1)   speculative
-10:02:00   (10:00-10:05, doc_88, 1)   speculative
-10:03:00   (10:00-10:05, doc_88, 3)   speculative
-10:04:00   (10:00-10:05, doc_88, 3)   speculative
-10:05:00   (10:00-10:05, doc_88, 4)   speculative
-10:05:31   (10:00-10:05, doc_88, 5)   final
-```
+An early trigger firing every minute emits six rows for the same window — `1, 1, 3, 3, 4` as speculative results at 10:01 through 10:05, then `5` as the final one at 10:05:31.
 
 The panel now updates every minute instead of once at the end, at the cost of showing 3 when the answer turns out to be 5. This is a genuinely good pattern for dashboards — low latency *and* eventual correctness — provided the consumer treats each row as a replacement for the last rather than something to add up. Give the output a `window_start` key and an upsert sink and that happens naturally.
 
@@ -758,20 +635,13 @@ The panel now updates every minute instead of once at the end, at the cost of sh
 
 Joining streams is harder than joining tables, because a stream has no end and so you never know whether a match is still coming. Flink offers several shapes.
 
-**Window join** — join two streams within a shared window. Both sides must land in the same window, which makes boundary behaviour awkward.
+**Window join** — join two streams within a shared window. Both sides must land in the same window, which makes boundary behaviour awkward, as below.
 
 **Interval join** — for each record on the left, join records on the right whose timestamps fall within `[t − lower, t + upper]`. This is the natural formulation for most real problems: "join each click to impressions from the preceding ten minutes". Much easier to reason about than a window join.
 
-Why it is easier is best seen as a failure of the window join. Lantern wants to attribute each click to the search that produced it, with searches and clicks on separate streams:
+Why it is easier shows up as a failure of the window join. Lantern wants to attribute each click to the search that produced it — a search at 10:04:58, a click five seconds later at 10:05:03. On five-minute tumbling windows, the search lands in `10:00–10:05` and the click in `10:05–10:10`, so **they do not join**: the click is attributed to nothing and the search looks like it produced no result. The pair was five seconds apart and a window boundary happened to fall between them, which befalls roughly one search in sixty purely as a function of where the clock's grid lands.
 
-```
-searches:  s1 @ 10:04:58
-clicks:                   c1 @ 10:05:03   ← the user clicked 5 s later
-```
-
-With a **window join** on five-minute tumbling windows, `s1` lands in window 10:00–10:05 and `c1` lands in 10:05–10:10. Different windows, so **they do not join** — the click is attributed to nothing, and the search looks like it produced no result. The pair was five seconds apart and a window boundary fell between them. Roughly one search in sixty suffers this, purely as a function of where the clock's grid happens to land.
-
-With an **interval join** the boundary does not exist:
+The interval join has no grid:
 
 ```java
 searches.keyBy(s -> s.searchId)
@@ -780,44 +650,34 @@ searches.keyBy(s -> s.searchId)
     .process(new AttributeClick());
 ```
 
-`c1` is 5 seconds after `s1`, which is inside `[s1 + 0s, s1 + 10min]`, so they join. The condition is expressed relative to each record rather than to a grid, which is what the business rule actually said. And the interval is what bounds the state: Flink can drop a search once the watermark has passed its timestamp plus ten minutes, because nothing can match it after that.
+The click is 5 seconds after the search, inside `[search + 0s, search + 10min]`, so they join. The condition is relative to each record rather than to a clock, which is what the business rule actually said — and the interval is also what bounds the state, since Flink can drop a search once the watermark passes its timestamp plus ten minutes.
 
 **Temporal join** — and this one deserves attention, because it solves a problem §4.7 raised and left open.
 
 Recall the backfill hazard: enriching an event by joining against a dimension table that has since changed produces different answers on re-run. A temporal join fixes it by joining against the **version of the dimension as of the event's own event time**.
 
-Concretely. `doc_88` was owned by the Support team until it was transferred to Engineering on 1 April:
+Concretely: `doc_88` belonged to Support until it transferred to Engineering on 1 April, and a view of it happened on **15 March**. Which team gets credit?
 
-```
-doc_88 versions:
-  owner = Support      valid 2023-01-05 → 2026-04-01
-  owner = Engineering  valid 2026-04-01 → now
-```
-
-A view of `doc_88` happened on **15 March**. Which team gets credit for it?
-
-| Join type | Result when run in February | Result when re-run today |
+| Join type | Run in February | Re-run today |
 |---|---|---|
 | ordinary join against current state | Support | **Engineering** |
 | temporal join on event time | Support | **Support** |
 
-The first row is the hazard in one line: the same job, the same input, two different answers, and nothing in the code changed — only the world did. Last quarter's report is no longer reproducible, and when someone notices the numbers moved, there is nothing to debug, because nothing was wrong.
+The first row is the hazard in one line: same job, same input, two answers, and nothing in the code changed — only the world did. Last quarter's report stops being reproducible, and there is nothing to debug, because nothing was wrong.
 
 ```sql
--- Flink SQL: FOR SYSTEM_TIME AS OF is the whole mechanism
 SELECT v.doc_id, v.event_time, d.owner_team
 FROM document_views v
-JOIN documents FOR SYSTEM_TIME AS OF v.event_time AS d
-  ON v.doc_id = d.doc_id;
+JOIN documents FOR SYSTEM_TIME AS OF v.event_time AS d ON v.doc_id = d.doc_id;
 ```
 
-Flink maintains the versioned dimension in state, keyed and time-indexed, and looks up the version whose validity range contains `v.event_time` — 15 March, therefore Support, today and forever.
+Flink keeps the versioned dimension in state, keyed and time-indexed, and looks up the version whose validity range contains `v.event_time` — 15 March, therefore Support, today and forever.
 
 This is point-in-time correctness as a primitive, and it makes reprocessing deterministic. If you have ever had a backfill produce different numbers than the original run for reasons nobody could explain, this is very often the reason.
 
-**`connect` and `CoProcessFunction`** — two streams of different types sharing state. The canonical use is a control stream: a low-volume stream of rules or configuration updates writes into state that a high-volume event stream reads. Combine with **broadcast state** when every parallel subtask needs the full rule set rather than a partition of it. This is how you build a streaming job whose behaviour can be changed without redeploying it.
+**`connect` and `CoProcessFunction`** — two streams of different types sharing state. The canonical use is a control stream: a low-volume stream of rules writes into state that a high-volume event stream reads, with **broadcast state** when every subtask needs the full rule set rather than a partition of it. This is how you change a job's behaviour without redeploying it.
 
-**Async I/O** — deserves a specific warning. If your job enriches each record by calling an external service (a REST API, a database, an embedding model), a synchronous call inside `processElement` blocks the operator thread for the whole round trip. At ten milliseconds per call, one subtask manages a hundred records per second, and your carefully parallelised job is limited by network latency rather than by anything computational.
+**Async I/O** — deserves a specific warning. If your job enriches each record by calling an external service, a synchronous call inside `processElement` blocks the operator thread for the whole round trip. At ten milliseconds per call one subtask manages a hundred records per second, and your carefully parallelised job is limited by network latency rather than by anything computational.
 
 ```java
 AsyncDataStream.unorderedWait(stream, new AsyncEnricher(),
@@ -854,17 +714,16 @@ FROM TABLE(
 GROUP BY window_start, window_end, document_id;
 ```
 
-And what comes out, as windows close, one row per document per window:
+Which emits, as each window closes, one row per document per window:
 
 ```
 window_start          document_id   views   unique_viewers
 2026-09-19 10:00:00   doc_88        5       4
 2026-09-19 10:00:00   doc_12        1       1
-2026-09-19 10:05:00   doc_88        2       2
-   ... (nothing for 10:05 until the watermark passes 10:10)
+   ... (nothing for the 10:05 window until the watermark passes 10:10)
 ```
 
-That is Lantern's trending panel, complete, and every mechanism in this chapter is present in those thirty lines without being written by hand. `WATERMARK FOR event_time AS event_time - INTERVAL '30' SECOND` is the §6.5 generator. `TUMBLE` is the §6.6 window. `GROUP BY window_start, document_id` is the `keyBy` and the keyed state. Checkpointing, recovery, and state cleanup are the planner's problem. This replaces several hundred lines of DataStream code, and the optimiser is good.
+That is Lantern's trending panel, complete, and every mechanism in this chapter is present in it without being written by hand. `WATERMARK FOR event_time AS event_time - INTERVAL '30' SECOND` is the §6.5 generator. `TUMBLE` is the §6.6 window. `GROUP BY window_start, document_id` is the `keyBy` and the keyed state. Checkpointing, recovery, and state cleanup are the planner's problem. This replaces several hundred lines of DataStream code, and the optimiser is good.
 
 Three concepts you need in order to read streaming SQL without being confused.
 
@@ -872,23 +731,13 @@ Three concepts you need in order to read streaming SQL without being confused.
 
 **Append-only versus changelog streams.** This is the one that trips people up. A *windowed* aggregation is append-only: once the window closes its result is final, so each row is emitted once. But a `GROUP BY` **without** a window — "total views per document, ever" — produces a result that changes with every new record. So Flink emits a **changelog**: a retraction of the old row followed by an insertion of the new one.
 
-Side by side, for three views of `doc_88`. The windowed query emits:
+Side by side, for three views of `doc_88`. The windowed query emits one row, once: `+I (10:00-10:05, doc_88, 3)`. Drop the window and the same three views emit five:
 
 ```
-+I (10:00-10:05, doc_88, 3)          one row, once, final
++I (doc_88, 1)   -U (doc_88, 1)   +U (doc_88, 2)   -U (doc_88, 2)   +U (doc_88, 3)
 ```
 
-The unwindowed `SELECT document_id, COUNT(*) FROM views GROUP BY document_id` emits:
-
-```
-+I (doc_88, 1)     ← first view
--U (doc_88, 1)     ← retract the old answer
-+U (doc_88, 2)     ← the new answer
--U (doc_88, 2)
-+U (doc_88, 3)
-```
-
-Five rows to express "the count is 3", because a downstream consumer that saw only `+U (doc_88, 3)` without the retraction of `2` would double-count if it were summing. Three views of one document produced five output rows; a million views produce two million.
+Five rows to say "the count is 3", because a consumer that saw only `+U (doc_88, 3)` without the retraction of `2` would double-count if it were summing. A million views produce two million rows.
 
 The practical consequence is that your **sink must support upserts** — `upsert-kafka`, a JDBC upsert, OpenSearch keyed by document ID. A plain append-only sink will reject a changelog stream with:
 
@@ -897,7 +746,7 @@ Table sink 'default_catalog.default_database.trending' doesn't support
 consuming update changes which is produced by node GroupAggregate(...)
 ```
 
-which is accurate and does not obviously mean "you forgot the window", which is what it means about ninety percent of the time.
+which is accurate and does not obviously mean "you forgot the window" — which is what it means about ninety percent of the time.
 
 **Unbounded aggregation state grows forever.** A non-windowed `GROUP BY document_id` keeps state for every document ID ever seen. This is §6.3's unbounded state problem arriving through SQL, where it is easier to write by accident. Bound it with `table.exec.state.ttl`.
 
@@ -907,9 +756,7 @@ My recommendation: **express what you can in SQL, and drop to DataStream or Proc
 
 ### How a job actually gets deployed
 
-Worth stating plainly, because the chapter has so far described what a job *is* without saying how it comes to be running.
-
-You compile your job into a JAR (or a Python file, or a SQL script), and you submit it to a cluster:
+Worth stating plainly, because the chapter has described what a job *is* without saying how it comes to be running. You compile it into a JAR (or a Python file, or a SQL script) and submit it:
 
 ```
 flink run -d -c com.lantern.TrendingJob trending.jar
@@ -946,26 +793,16 @@ Flink SQL has a third route: a SQL script submitted through the SQL client or a 
 
 The first row is there because it is the most common, and the sixth is there because it is the most expensive.
 
-On skew: the fix worth knowing is **two-phase aggregation**. Lantern's onboarding handbook is viewed by every new employee and accounts for a third of all views, so `keyBy(document_id)` sends a third of the entire stream to one subtask:
-
-```
-subtask 3:  doc_onboarding        →  16,000 records/s   ← saturated, lagging
-subtask 4:  doc_88, doc_12, ...   →     400 records/s
-subtask 5:  doc_40, doc_71, ...   →     380 records/s
-```
-
-Adding more parallelism does nothing, because one key cannot be split across subtasks. So split it artificially — append a random salt of 0–99 to the key:
+On skew: the fix worth knowing is **two-phase aggregation**. Lantern's onboarding handbook is read by every new employee and accounts for a third of all views, so `keyBy(document_id)` sends 16,000 records/s to one subtask while its neighbours handle 400. More parallelism does not help, because one key cannot be split across subtasks — so split it artificially:
 
 ```java
-// phase 1: 100 partial counts, spread across all subtasks
-.keyBy(v -> v.documentId + "#" + rnd.nextInt(100))
+.keyBy(v -> v.documentId + "#" + rnd.nextInt(100))   // phase 1: 100 partials, spread wide
 .window(...).aggregate(new Count())
-// phase 2: 100 small partials combine into one
-.keyBy(p -> p.documentId)
+.keyBy(p -> p.documentId)                            // phase 2: combine the 100
 .window(...).aggregate(new Sum())
 ```
 
-The hot key's 16,000 records/s becomes a hundred streams of 160/s each, spread over every subtask; phase two then handles a hundred records per window instead of sixteen thousand per second. You have traded one serial hot key for two cheap parallel stages. The same trick appears in Spark under the name salting (§7.1).
+The hot key's 16,000/s becomes a hundred streams of 160/s, and phase two handles a hundred records per window instead of sixteen thousand per second. One serial hot key traded for two cheap parallel stages. The same trick appears in Spark under the name salting (§7.1).
 
 ### Flink, Kafka Streams, or Spark?
 
