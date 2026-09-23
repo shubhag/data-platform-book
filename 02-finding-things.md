@@ -1,20 +1,18 @@
 # Chapter 2 — Finding Things
 
-## How to read this chapter
+Lantern has two hundred million documents and a search box, and a database can tell you which documents match a pattern but not which are *about* something. This chapter builds the structure that can, the inverted index, and follows it through OpenSearch across many machines. Every rule is shown on a ten-document lab you can run on a laptop.
 
-This chapter has one job: to get you from "I have used a database" to "I can reason about a search engine". It is long, so here is the shape of it before you start.
+**By the end you'll be able to:**
 
-**There is one example, and it runs.** Ten documents from Lantern's wiki, indexed into a real OpenSearch you start in §2.0 with one command. Every rule in this chapter is demonstrated by a request you can paste into a terminal and a response you can look at. Ten documents instead of two hundred million, but every mechanism is visible at ten.
-
-**Every section starts with something breaking.** A search returns nothing. A sort throws an error. A document is indexed and then cannot be found. The mechanism is introduced to explain the failure, not before it. If you ever feel a term arrive before you needed it, that is a bug in the chapter and not in you.
-
-**The spine is: build it on one machine, then make it survive many machines, then operate it.** §2.1 to §2.2 build the data structure. §2.3 splits it across machines. §2.4 to §2.9 make it correct and fast. §2.10 to §2.11 keep it alive. §2.12 shows you the wall it hits, which is what Chapter 3 is for.
-
-**The last two sections are reference, not reading.** The one-page summary and the glossary at the end are for later.
+- Explain how an inverted index answers a query without scanning, and why doc values exist alongside it.
+- Choose between `text` and `keyword`, and between query and filter context, without guessing.
+- Diagnose "this should match and doesn't" in seconds with `_analyze`.
+- Read a BM25 score, improve relevance, and measure whether you did.
+- Operate an index safely: bulk writes, aliases, reindexing, cluster health and sizing.
 
 ---
 
-## §2.0 The lab
+## 2.0 The lab
 
 Start a single-node OpenSearch. One command, about thirty seconds:
 
@@ -26,20 +24,7 @@ docker run -d --name lantern -p 9200:9200 \
   opensearchproject/opensearch:2
 ```
 
-Check it is up:
-
-```bash
-curl -s localhost:9200 | head -5
-```
-
-```json
-{
-  "name" : "a1b2c3d4e5f6",
-  "cluster_name" : "docker-cluster",
-  "cluster_uuid" : "...",
-```
-
-Now create the index. One shard, no replicas — on a laptop that is the honest configuration, and one shard also makes every relevance score in this chapter reproducible for reasons that become clear in §2.7.
+Create the index with one shard and no replicas, which makes every score in this chapter reproducible (§2.7 explains why).
 
 ```bash
 curl -s -X PUT localhost:9200/documents -H 'Content-Type: application/json' -d '
@@ -57,7 +42,7 @@ curl -s -X PUT localhost:9200/documents -H 'Content-Type: application/json' -d '
 }'
 ```
 
-And load the corpus. Ten documents, one bulk request. Note `?refresh=wait_for`, which we will come back to and explain in §2.6 — without it the documents are indexed but not yet findable, which is the single most confusing thing about this system.
+Load the corpus. Without `?refresh=wait_for` the documents would be indexed but not yet findable (§2.6).
 
 ```bash
 curl -s -X POST 'localhost:9200/_bulk?refresh=wait_for' -H 'Content-Type: application/x-ndjson' --data-binary '
@@ -82,11 +67,6 @@ curl -s -X POST 'localhost:9200/_bulk?refresh=wait_for' -H 'Content-Type: applic
 {"index":{"_index":"documents","_id":"d10"}}
 {"title":"Postgres replication basics","body":"Streaming replication ships the write-ahead log to a standby.","team":"data","status":"published","updated_at":"2025-05-05"}
 '
-```
-
-Confirm all ten landed:
-
-```bash
 curl -s 'localhost:9200/documents/_count'
 ```
 
@@ -94,62 +74,45 @@ curl -s 'localhost:9200/documents/_count'
 {"count":10,"_shards":{"total":1,"successful":1,"skipped":0,"failed":0}}
 ```
 
-That is the whole lab. Keep the terminal open; everything from here on runs against it, and `docker rm -f lantern` tears it down when you are finished.
+That is the whole lab. Every response printed in this chapter is the real one from this setup, and `docker rm -f lantern` tears it down.
 
-Every request in this chapter was run against exactly this setup, and every response printed is the real one. If yours differs, that is worth a moment of your attention rather than none.
-
-> **A note on the corpus.** d9 is about the novelist, and it is there on purpose: it will match "kafka" perfectly and be useless every time, which is the entire problem of relevance in one document. d7 is titled "Diagnosing CrashLoopBackOff" and will turn out to be unfindable by the people who need it most, which is the entire problem of Chapter 3 in one document.
+> **A note on the corpus.** d9, about the novelist, will match "kafka" perfectly and be useless every time: the problem of relevance in one document. d7, "Diagnosing CrashLoopBackOff", will be unfindable by the people who need it most: the problem of Chapter 3 in one document.
 
 ---
 
-## §2.1 Why the database can't do this
+## 2.1 Why the database can't do this
 
-Lantern has two hundred million documents in PostgreSQL and a search box. The obvious implementation:
+The obvious implementation of Lantern's search box is hopeless:
 
 ```sql
 SELECT * FROM documents WHERE body LIKE '%kafka%';
 ```
 
-Let us be precise about why this is hopeless, because each reason tells you something about what has to replace it.
-
 ### It is slow, and an index cannot save it
 
-You know an index makes queries fast. Here is why *this* query cannot use one.
-
-A B-tree index is a sorted structure — a phone book, sorted by the **beginning** of the value:
+A B-tree index is sorted by the **beginning** of the value, like a phone book. `LIKE 'Kafka%'` is fast: binary-search to the K's, read forward, stop. `LIKE '%kafka%'` is not, because the matches are scattered through the sort order:
 
 ```
-"Diagnosing CrashLoopBackOff"
-"Kafka consumer groups rebalance"
-"Kafka partitions are ordered"
-"Ordered delivery in Kafka"
+"Kafka consumer groups rebalance"  ← matches, filed under K
+"Ordered delivery in Kafka"        ← matches, filed under O
 "Postgres replication basics"
-"The Kafka log is append only"
-"The novelist Franz Kafka"
+"The novelist Franz Kafka"         ← matches, filed under T
 ```
 
-Ask for `LIKE 'Kafka%'` — *starts with* — and the index is beautiful. Binary-search to the K's, read forward until you leave them, stop. You skipped almost everything because sorting told you where to look.
-
-Now ask for `LIKE '%kafka%'` — *contains, anywhere*. Look at the list above. `"Ordered delivery in Kafka"` matches and is filed under O. `"The novelist Franz Kafka"` matches and is filed under T. The matches are scattered uniformly through the sort order, so **sorting tells you nothing about where they are, and there is nothing to skip**. The database reads all forty terabytes. That is a full table scan, and no index of this kind can prevent it, because the index is sorted by the wrong thing.
-
-Hold on to that phrase — *sorted by the wrong thing*. §2.2 is precisely the structure sorted by the right thing.
+There is nothing to skip, so the database reads all forty terabytes. The index is **sorted by the wrong thing**; §2.2 is the structure sorted by the right thing.
 
 ### It is wrong, four times
 
-Run the SQL mentally against the ten documents.
+Run the SQL mentally against the ten documents:
 
-1. **Case.** `'%kafka%'` misses d1, d2, d5, d9 — all four capitalise it. You can write `LOWER(body) LIKE '%kafka%'`, but now you must remember to lowercase in two places forever, and one day someone won't.
-2. **Word forms.** Searching `streaming` misses a document that says `streams`. Two unrelated strings to the database; one idea to a human.
-3. **Multiple words.** `'%kafka ordering%'` matches **nothing** — no document contains that character sequence. But d1 and d2 are exactly what the user wanted. The user typed two concepts; SQL heard one literal string.
-4. **Spurious matches.** `'%kafka%'` cheerfully returns d9, about the novelist. It matches. It is useless.
+1. **Case.** `'%kafka%'` misses every Kafka document here, because they all capitalise it.
+2. **Word forms.** `streaming` misses a document that says `streams`.
+3. **Multiple words.** `'%kafka ordering%'` matches nothing, though d1 and d2 are exactly what the user wanted.
+4. **Spurious matches.** It cheerfully returns d9, about the novelist.
 
-### And the deepest problem: there is no "best"
+### And there is no "best"
 
-Even if you fixed all of the above, the query returns eleven thousand rows **in no particular order**. The user wants ten rows, and specifically the *best* ten.
-
-The database has no concept of "best". It can tell you whether a row matches. It cannot tell you that one match is better than another, because **relevance is not a predicate**. There is no `WHERE` clause for "about".
-
-That is the real split, and it is worth stating as a table because the rest of the chapter falls out of it:
+Even fixed, the query returns eleven thousand rows in no order. The user wants the *best* ten, and **relevance is not a predicate**: there is no `WHERE` clause for "about".
 
 | | Database retrieval | Search |
 |---|---|---|
@@ -157,274 +120,133 @@ That is the real split, and it is worth stating as a table because the rest of t
 | The answer | the set of matching rows | an *ordered* list, best first |
 | "Correct" means | exactly the matching rows | the user found what they wanted |
 
-That last row is the uncomfortable one. **Search has no provably correct answer.** Which is why §2.9 spends so long on *measuring* relevance: when there is no proof, you need evidence.
+**Search has no provably correct answer**, which is why §2.9 spends so long on measuring relevance.
 
 ---
 
-## §2.2 The inverted index
+## 2.2 The inverted index
 
 ### Turn the arrow around
 
-A database stores, in effect, a forward map — *document → its contents*:
+A database maps *document → contents*: perfect for "show me d2", useless for "who mentions Kafka?". So invert it, and for each word list the documents containing it. Part of the real thing, from your ten titles:
 
 ```
-d1 → "Kafka partitions are ordered"
-d2 → "Ordered delivery in Kafka"
-d3 → "Spark partitions and tasks"
-```
-
-Perfect for "show me d2". Useless for "who mentions Kafka?", which requires reading everything.
-
-So invert it. For each word, write down which documents contain it. Here is the real thing, built from the ten titles in your lab:
-
-```
-and         → [d3]
-append      → [d5]
-are         → [d1]
-basics      → [d10]
-consumer    → [d4]
-crashloopbackoff → [d7]
 delivery    → [d2]
-diagnosing  → [d7]
-franz       → [d9]
-groups      → [d4]
-in          → [d2]
-is          → [d5]
 kafka       → [d1, d2, d4, d5, d9]
-kubernetes  → [d8]
-limits      → [d8]
-log         → [d5]
-memory      → [d8]
-novelist    → [d9]
-only        → [d5]
 ordered     → [d1, d2]
 partitions  → [d1, d3, d6]
-pod         → [d8]
-postgres    → [d10]
-rebalance   → [d4]
-replication → [d10]
-shuffle     → [d6]
 spark       → [d3, d6]
-tasks       → [d3]
-the         → [d5, d9]
-tuning      → [d6]
+...
 ```
 
-That is an inverted index. The left column, sorted so you can binary-search it, is the **term dictionary**. Each right-hand list is a **postings list**.
-
-You have met this structure before without noticing: it is the index at the back of a textbook. *Kafka … 12, 47, 88.* Nobody reads a book cover to cover to find the Kafka pages. Thirteenth-century monks built exactly this by hand for the Bible and called it a concordance.
+That is an **inverted index**. The sorted left column is the **term dictionary**, and each right-hand list is a **postings list**. It is the index at the back of a textbook.
 
 ### Why this makes queries fast
 
-**One term.** "Who mentions kafka?" → binary-search the dictionary to `kafka`, read the list: `[d1, d2, d4, d5, d9]`. You never opened a single document. The cost depends on the length of that list, not on the size of the corpus. Ten documents or ten billion, the lookup is the same shape.
+**One term.** Binary-search the dictionary to `kafka` and read the list. The cost depends on the list's length, not the corpus size.
 
-**Two terms, AND.** "kafka AND partitions" is the **intersection** of two sorted lists:
-
-```
-kafka       → [d1, d2, d4, d5, d9]
-partitions  → [d1, d3, d6]
-```
-
-Because both lists are sorted, you walk them with two fingers, always advancing whichever finger is behind:
+**Two terms, AND.** "kafka AND partitions" is the **intersection** of the two sorted lists. Walk them with two fingers, always advancing whichever is behind:
 
 ```
 A on d1,  B on d1   → equal! emit d1, advance both
-A on d2,  B on d3   → 2 < 3, advance A
-A on d4,  B on d3   → 3 < 4, advance B
-A on d4,  B on d6   → 4 < 6, advance A
-A on d5,  B on d6   → 5 < 6, advance A
-A on d9,  B on d6   → 6 < 9, advance B
-B runs out          → done
+A on d2,  B on d3   → advance A
+A on d4,  B on d3   → advance B
+A on d4,  B on d6   → advance A
+A on d5,  B on d6   → advance A
+A on d9,  B on d6   → advance B; B runs out → done
 
 result: [d1]
 ```
 
-The work is bounded by the total length of the lists — and real engines skip ahead rather than stepping one at a time, so it is closer to the length of the *shorter* list. This is why a five-word query over a billion documents returns in single-digit milliseconds. **Nothing is being scanned.** Five precomputed lists are being intersected.
+Real engines skip ahead, so the work is closer to the length of the *shorter* list. That is why a five-word query over a billion documents takes milliseconds: **nothing is scanned**. This is the most important mechanical idea in the chapter.
 
-This is the single most important mechanical idea in the chapter. Everything else is refinement.
+### What is in a postings entry
 
-### What is actually in a postings entry
-
-Real postings carry more than a document number. Two extras matter.
-
-**Term frequency (tf)** — how many times the term appears in that document. Needed for ranking in §2.9: a document saying "kafka" eight times is more likely to be *about* Kafka than one that says it once in a footnote.
-
-**Positions** — where in the field, as word offsets.
-
-```
-kafka → [ d1(tf=1, pos=[0]), d2(tf=1, pos=[3]), d4(tf=1, pos=[0]),
-          d5(tf=1, pos=[1]), d9(tf=1, pos=[3]) ]
-```
-
-Positions are what make **phrase search** possible. Take the phrase `"ordered delivery"` against d2, `"Ordered delivery in Kafka"`:
-
-```
-ordered  in d2 at position [0]
-delivery in d2 at position [1]
-```
-
-Intersect first to find documents containing both words (only d2 qualifies), then check positions: is there a position of `delivery` exactly one greater than a position of `ordered`? `1 = 0 + 1`. Yes — d2 contains the phrase.
-
-Now d1, `"Kafka partitions are ordered"`: it has `ordered` at position 3 but no `delivery` at all, so it never survives the intersection. And a hypothetical document saying *"delivery was ordered"* would survive the intersection but fail the position check — `ordered` at 2, `delivery` at 0, and `0 ≠ 3`. Correctly rejected.
-
-Try both against your lab:
-
-```bash
-curl -s 'localhost:9200/documents/_search?filter_path=hits.hits._id' -H 'Content-Type: application/json' -d '
-{ "query": { "match": { "title": "ordered delivery" } } }'
-```
-
-```json
-{"hits":{"hits":[{"_id":"d2"},{"_id":"d1"}]}}
-```
+Real postings also carry **term frequency (tf)**, how often the term appears in the document (for ranking, §2.9), and **positions**, its word offsets in the field. Positions make **phrase search** possible. In d2, "Ordered delivery in Kafka", `ordered` is at position 0 and `delivery` at 1, so d2 contains `"ordered delivery"`; "delivery was ordered" would fail the check. Try it:
 
 ```bash
 curl -s 'localhost:9200/documents/_search?filter_path=hits.hits._id' -H 'Content-Type: application/json' -d '
 { "query": { "match_phrase": { "title": "ordered delivery" } } }'
+# → {"hits":{"hits":[{"_id":"d2"}]}}
 ```
 
-```json
-{"hits":{"hits":[{"_id":"d2"}]}}
-```
-
-`match` found both documents containing *either* word; `match_phrase` used the positions and found only the one where they are adjacent. That extra position check is why `match_phrase` costs more than `match` — and why it is still fast, because the expensive filtering already happened.
+Change `match_phrase` to `match` and you get d2 and d1: `match` wants either word, `match_phrase` uses positions to keep only the adjacent pair. That check runs after the intersection has done the heavy filtering.
 
 ### Doc values: the other direction
 
-The inverted index answers **"given a term, which documents?"** superbly.
-
-Now ask the opposite: **"given d4, what is its `updated_at`?"** You need this to *sort* results by date, to *average* a numeric field, to count documents per team.
-
-Try it with an inverted index. You would have to walk every date in the dictionary asking "is d4 in your list?" until one said yes. Hopeless — the structure is oriented the wrong way.
-
-So the engine builds a **second** structure at the same time, called **doc values**: for each field, every document's value laid out contiguously in document order.
-
-```
-doc values for `team`:
-  doc:    d1        d2        d3     d4        d5        d6     ...
-  value:  platform  platform  data   platform  platform  data   ...
-```
-
-To sort ten thousand results by team you read this array at ten thousand offsets. Contiguous, columnar, memory-mapped so the operating system pages in what is needed — very fast.
+Now ask the opposite: "what is d4's `updated_at`?" Sorting and aggregating need that, and an inverted index is oriented the wrong way. So the engine also builds **doc values**: for each field, every document's value laid out contiguously in document order (`team`: platform, platform, data, platform, …).
 
 ```
 inverted index:   term → [documents]     "who has this value?"
 doc values:       document → value       "what is this document's value?"
 ```
 
-**Two structures, opposite orientations, both built when you index.** Keep this pair in your head, because the chapter's most confusing rules are consequences of it:
-
-- You *search* with the inverted index.
-- You *sort and aggregate* with doc values.
-- A `text` field has no useful doc values — it was shredded into terms, so there is no single value to store — which is why **you cannot sort or aggregate on a `text` field**. That rule in §2.4 is not an arbitrary restriction. There is literally no data there to read.
-
-Watch it fail, right now:
+**Two structures, opposite orientations, both built at index time.** You *search* with the inverted index and *sort and aggregate* with doc values. A `text` field was shredded into terms, so it has no single value to store, which is why **you cannot sort or aggregate on a `text` field**:
 
 ```bash
 curl -s 'localhost:9200/documents/_search' -H 'Content-Type: application/json' -d '
-{ "sort": [ { "title": "asc" } ] }' | head -c 400
+{ "sort": [ { "title": "asc" } ] }'
 ```
 
 ```json
 {"error":{"root_cause":[{"type":"illegal_argument_exception","reason":
 "Text fields are not optimised for operations that require per-document
-field data like aggregations and sorting, so these operations are disabled
-by default. Please use a keyword field instead..."}]}}
+field data like aggregations and sorting ... Please use a keyword field instead..."}]}}
 ```
-
-The error message is telling you exactly what this section just said. §2.4 gives you the fix.
 
 ---
 
-## §2.3 The shape of the system
+## 2.3 The shape of the system
 
-So far everything has been a data structure on one machine. That machine is real, and it has a name.
-
-**Lucene** is a Java *library* that implements everything in §2.2 — term dictionary, postings lists, positions, doc values, scoring. It runs in one process, over one set of files on one disk. It has no notion of a network.
-
-**OpenSearch** wraps Lucene in a distributed system: an HTTP API, splitting data across machines, replication, failure handling, cluster management.
+**Lucene** is a Java *library* that implements everything in §2.2, in one process, over files on one disk. **OpenSearch** wraps Lucene in a distributed system: HTTP API, data split across machines, replication, failure handling.
 
 > *Lucene does the searching. OpenSearch does the distributing.*
 
-When something confuses you, ask which layer owns it. Scoring is Lucene. Shard placement is OpenSearch. (OpenSearch is a 2021 fork of Elasticsearch, branched at 7.10 over a licence change, which is why almost all Elasticsearch documentation and Stack Overflow answers apply verbatim.)
+(OpenSearch is a 2021 fork of Elasticsearch 7.10, so most Elasticsearch documentation applies verbatim.)
 
-### The wall: two hundred million documents do not fit
+### Splitting it up
 
-Your lab holds ten documents in one Lucene index. Lantern holds two hundred million, which is roughly six terabytes. That does not fit on one machine, and even if it did, one machine searching six terabytes is one machine's worth of CPU.
-
-So the index is **split**, exactly as §1.3 described. The vocabulary nests:
+Lantern's two hundred million documents are roughly six terabytes, too much for one machine, so the index is split as §1.3 described:
 
 ```
 Cluster          the whole deployment
  └── Node        one OpenSearch process on one machine
    └── Index     a named collection of documents ("documents")
-     └── Shard   a slice of the index — itself a complete Lucene index
+     └── Shard   a slice of the index, itself a complete Lucene index
        └── Segment    an immutable file of indexed data
-         └── Document one JSON object
-           └── Field  one named value inside it
+         └── Document one JSON object (kept verbatim in `_source`)
 ```
 
-**Document** — one JSON object, the unit you put in and get back:
-
-```json
-{ "_id": "d1",
-  "title": "Kafka partitions are ordered",
-  "body": "Within a partition Kafka guarantees order...",
-  "team": "platform",
-  "updated_at": "2026-03-01" }
-```
-
-The original JSON is kept verbatim in a field called `_source` so it can be returned to you. You *can* disable `_source` to save space, and you almost never should: without it you cannot reindex, cannot use the update API, and cannot see what you actually stored.
-
-**Index** — a named collection of documents sharing a schema. "Like a table" is roughly right and slightly misleading, because an index is much more expensive than a table: each one costs heap, file handles, and cluster metadata. "One index per customer" across ten thousand customers is a recognised way to kill a cluster.
-
-**Shard** — here is the idea that takes longest to internalise, so let me be blunt about it:
+Keep `_source` on: without it you cannot reindex or use the update API. And an index is "like a table" but far more expensive: "one index per customer" across ten thousand customers is a known way to kill a cluster. The idea that takes longest to sink in:
 
 > **A shard is not a piece of a search engine. A shard IS a search engine.**
 
-Split the ten lab documents across three shards and you would get something like:
+Split the lab across three shards and shard 2 might hold d3, d6 and d9, with its *own* term dictionary, postings and doc values, answering any query correctly about its own three documents. Three consequences:
 
-```
-shard 0: d1, d4, d7, d10
-shard 1: d2, d5, d8
-shard 2: d3, d6, d9
-```
+1. **Searching an index means searching every shard and merging**: §1.3's scatter-gather, as slow as the slowest shard.
+2. **Relevance scores differ slightly between shards** (§2.7), because term rarity is computed per shard.
+3. **`terms` aggregations are approximate** (§2.8), for the same reason.
 
-Shard 2 has its *own* term dictionary, its *own* postings lists, its own doc values, its own internal document numbering starting at 0. It does not know shards 0 and 1 exist. Hand it a query and it will answer completely and correctly — about its own three documents.
+### Primaries and replicas
 
-Three consequences drop straight out of that one fact, and the chapter returns to all three:
-
-1. **Searching an index means searching every shard and merging the results.** That is §1.3's scatter-gather, with its straggler problem: the query is as slow as the slowest shard.
-2. **Relevance scores differ slightly between shards** (§2.7), because "how rare is this term?" is computed per shard, from local documents only.
-3. **`terms` aggregations are approximate** (§2.8), for the same reason — each shard only knows its own counts.
-
-This is also why your lab uses `"number_of_shards": 1`. With ten documents across three shards, "how rare is kafka?" would be computed from three or four documents at a time and the scores would be nonsense. One shard makes every number in this chapter reproducible.
-
-**Primaries and replicas.** A **primary** shard accepts writes. A **replica** is an exact copy on a *different* node; it serves reads and gets promoted if the primary's node dies. This is leader–follower replication from §1.4 with OpenSearch vocabulary on top.
+A **primary** shard accepts writes. A **replica** is an exact copy on a *different* node that serves reads and is promoted if the primary's node dies (§1.4's leader–follower replication).
 
 ```
 3 primaries, 1 replica each = 6 shards on 3 nodes
 
     Node A            Node B            Node C
   ┌──────────┐     ┌──────────┐     ┌──────────┐
-  │ P0       │     │ P1       │     │ P2       │
-  │ R2       │     │ R0       │     │ R1       │
+  │ P0  R2   │     │ P1  R0   │     │ P2  R1   │
   └──────────┘     └──────────┘     └──────────┘
 ```
 
-No shard shares a node with its own copy — the allocator enforces this, because a copy on the same machine protects against nothing. Kill node A: P0 is gone, but R0 on node B is promoted, and the cluster keeps serving. It then quietly builds a fresh replica of shard 0 somewhere.
+No shard shares a node with its own copy. Kill node A and R0 on node B is promoted; the cluster keeps serving and quietly rebuilds a replica elsewhere.
 
-And the rule that shapes the rest of the chapter:
+> **The primary count is fixed when the index is created. The replica count can change at any time.** §2.6 shows why.
 
-> **The primary count is fixed when the index is created. The replica count can change at any time.**
+### Segments: nothing is ever modified
 
-§2.6 shows you *why* (it is a modulus, and the arithmetic is worth doing yourself). §2.10 is mostly about living with it.
-
-### Segments, and the fact that nothing is ever modified
-
-Inside a shard, Lucene writes **segments** — files that, once written, are **never modified**.
-
-Which raises an obvious question: what happens when you update a document? Update d4 in your lab:
+Inside a shard, Lucene writes **segments**: files **never modified** once written. So what does an update do?
 
 ```bash
 curl -s -X POST 'localhost:9200/documents/_update/d4?refresh=wait_for' -H 'Content-Type: application/json' -d '
@@ -436,244 +258,99 @@ curl -s 'localhost:9200/documents/_stats/docs?filter_path=_all.primaries.docs'
 {"_all":{"primaries":{"docs":{"count":10,"deleted":1}}}}
 ```
 
-Ten live documents and **one deleted** — from a request you would have called an update. Here is what physically happened:
+Ten live documents and **one deleted**, from an update. The old version stays on disk, marked deleted, and the new one goes into a new segment; the bytes come back only when a background **merge** skips the dead documents. Deletes work the same way. Now set d4 back to `published` with the same request: the count reads `"deleted":2`, because undoing a change is another write.
 
-```
-segment_1:  d4 (version 1)                 ← still on disk, untouched
-segment_7:  d4 (version 2, status archived) ← new segment
-deletes:    "segment_1 doc 3 is deleted"    ← tiny auxiliary file
-```
+Tombstones are not inert: **deleted documents still count in the corpus statistics** BM25 uses (§2.9) until merges catch up.
 
-Both copies are on disk. Every search consults the deletion list and skips the old one. The old bytes are reclaimed only later, when a background **merge** combines small segments into a bigger one and simply declines to copy the dead documents forward. Deletes work identically: a tombstone now, real removal at merge.
-
-Put d4 back the way it was, and count again:
-
-```bash
-curl -s -X POST 'localhost:9200/documents/_update/d4?refresh=wait_for' -H 'Content-Type: application/json' -d '
-{ "doc": { "status": "published" } }' > /dev/null
-curl -s 'localhost:9200/documents/_stats/docs?filter_path=_all.primaries.docs'
-```
-
-```json
-{"_all":{"primaries":{"docs":{"count":10,"deleted":2}}}}
-```
-
-Still ten live documents, and now **two** dead ones. Undoing a change does not undo the writes; it adds another. Nothing shrinks until a merge.
-
-And a tombstone is not inert while it waits. **A deleted document still counts in the corpus statistics** — `N`, the number of documents, and `avgdl`, the average field length, both of which BM25 divides by in §2.9. Delete a million documents from a ten-million-document index and, until the merges catch up, every relevance score is computed as though they were still there. It is a real effect on clusters with high delete rates, and it is invisible unless you go looking at `_explain`.
-
-Why accept this weirdness? Immutable files:
-
-- need **no locking** — any number of threads read concurrently, coordinating about nothing;
-- can be **cached without invalidation**, because a cached copy can never go stale;
-- can be **copied to another node** for recovery without pausing anything;
-- are written **purely sequentially**, the fastest thing a disk does.
-
-The price: space comes back late, segment count must be managed, and merges burn real I/O and CPU in the background. Almost every performance oddity in §2.11 traces back to segments.
-
-You will meet this exact trade again in §5.1, where Kafka's log is fast for precisely the same reasons.
+Why accept this? Immutable files need **no locking**, are **cached without invalidation**, **copy** for recovery without pausing, and are written **sequentially**. The price is late space reclamation and merge I/O. Kafka's log (§5.1) is fast for the same reasons.
 
 ### Node roles
 
-In a small deployment every node does everything. As you grow, you separate the jobs.
+- **Cluster manager** (*master* in older docs): keeps cluster state (indexes, mappings, shard locations), holds no data, elected by quorum (§1.6). Run **three** dedicated ones: three survive one failure, a fourth adds nothing.
+- **Data nodes** hold shards and do the work. **Ingest, warm and cold** nodes run pre-indexing pipelines and hold older data cheaply.
+- **Coordinating node** is a *role in a request*: whichever node receives the query fans it out and merges results.
 
-- **Cluster manager** (called *master* in older documentation) — keeps the cluster state: which indexes exist, their mappings, where every shard lives. Holds no data, answers no queries. Elected by a quorum protocol of the kind in §1.6, which is why the recommendation is **three** dedicated nodes: three survive one failure, and a fourth adds nothing. It sounds like paperwork right up until it wobbles, at which point nothing works — which is why you give it its own machines rather than letting it compete with search traffic.
-- **Data nodes** — hold shards, do the indexing and searching. The expensive ones, and the ones you add for capacity.
-- **Coordinating node** — not a configuration but a *role in a request*. Whichever node receives your query fans it out, merges the responses, and replies. In a large cluster you dedicate nodes to this, because merging results from fifty shards is real work and you would rather it not steal CPU from searching.
-- **Ingest nodes** run lightweight transformation pipelines before indexing; **warm** and **cold** tiers hold older data on cheaper storage.
-
-### The allocator, quietly running
-
-A background loop on the cluster manager continuously tries to satisfy a set of constraints: every primary assigned somewhere; every replica on a different node from its primary; disk usage balanced; shard counts balanced; and any *awareness* rules respected — "spread the copies of each shard across availability zones, so losing a zone does not lose data."
-
-Node vanishes → promote replicas, rebuild the missing copies. Node added → move shards onto it. Both move real bytes over the network and take real time, which is one reason §2.11 wants shards in the tens of gigabytes rather than the hundreds.
+A background **allocator** keeps replicas off their primary's node, balances disk, and honours **awareness** rules (copies spread across availability zones). Moving shards moves real bytes, one reason §2.11 wants shards in the tens of gigabytes.
 
 ---
 
-## §2.4 The schema: mappings
+## 2.4 The schema: mappings
 
-A **mapping** is OpenSearch's schema. It declares, per field: what type it is, how it should be analysed, and whether it is searchable, sortable, aggregatable.
-
-Look at the one your lab is using:
-
-```bash
-curl -s 'localhost:9200/documents/_mapping?pretty'
-```
-
-```json
-{ "documents": { "mappings": { "properties": {
-  "body":       { "type": "text" },
-  "status":     { "type": "keyword" },
-  "team":       { "type": "keyword" },
-  "title":      { "type": "text" },
-  "updated_at": { "type": "date" }
-}}}}
-```
+A **mapping** is OpenSearch's schema: per field, its type, how it is analysed, and whether it is searchable, sortable and aggregatable.
 
 ### Dynamic mapping, and two ways it bites
 
-Index a document with a field OpenSearch has never seen and it **guesses** a type and permanently adds it to the mapping. Watch:
+Index a field OpenSearch has never seen and it **guesses** a type, permanently:
 
 ```bash
 curl -s -X POST 'localhost:9200/documents/_doc/d11?refresh=wait_for' -H 'Content-Type: application/json' -d '
 { "title": "Sharding strategies", "views": "417" }' > /dev/null
 curl -s 'localhost:9200/documents/_mapping?filter_path=documents.mappings.properties.views'
+# → ..."views":{"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}}...
 ```
 
-```json
-{"documents":{"mappings":{"properties":{"views":{"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}}}}}}
-```
+The producer forgot to strip the quotes, so `views` is a **text** field forever; the fix is a full reindex. Failure mode one: **the first document decides.**
 
-`views` was `"417"` — a string, because whoever wrote the producer forgot to strip the quotes — so `views` is now a **text** field, permanently. Try a numeric range on it and you will get coercion and confusion; the real fix is a full reindex. That is failure mode one: **the first document decides, forever.**
+Failure mode two is worse. Index user-supplied keys such as `utm_campaign_spring_2026` and dynamic mapping adds a field for **every distinct key**. The mapping lives in the cluster state, replicated to every node on every change, so the cluster manager drowns: **mapping explosion**. Defend with an explicit mapping via an **index template**, and either:
 
-Failure mode two is worse. Index a bag of user-supplied keys:
+- `"dynamic": "strict"`: reject documents with unknown fields; or
+- `"dynamic": false`: keep them in `_source` but do not index them.
 
-```json
-{ "properties": { "utm_campaign_spring_2026": "x", "ab_test_4471": "b" } }
-```
+Now delete d11 (`curl -s -X DELETE 'localhost:9200/documents/_doc/d11?refresh=wait_for'`). The `views` field stays: deleting the document does not un-guess the type.
 
-Dynamic mapping adds a field for **every distinct key it ever sees**. Ten thousand campaigns become ten thousand fields. The mapping lives in the cluster state; the cluster state is replicated to every node on every change; the cluster manager starts drowning; the cluster becomes unstable. This is called **mapping explosion**, and the fact that it has a name should tell you how often it happens.
+### `text` vs `keyword`
 
-The defence is to define mappings explicitly through an **index template** and then set one of:
+A **`text`** field is **analysed** into separate terms (lowercased, maybe stemmed). A **`keyword`** field is **not analysed**: the whole value is exactly one term, byte for byte. Take `"Senior Java Engineer"`:
 
-- `"dynamic": "strict"` — reject documents containing unknown fields;
-- `"dynamic": false` — keep them in `_source` but do not index them.
+| | As `text` (terms `senior`, `java`, `engineer`) | As `keyword` (one term) |
+|---|---|---|
+| Search `java engineer` | matches | no match |
+| Exact lookup `"Senior Java Engineer"` | **no match**: the whole was never stored | matches |
+| Sort / aggregate | not possible | works (it has doc values) |
 
-For anything user-supplied, pick one. Now take d11 back out, so that the corpus is ten documents again and every score later in the chapter is reproducible:
+In the lab, `title` is `text` and `team` is `keyword`:
 
 ```bash
-curl -s -X DELETE 'localhost:9200/documents/_doc/d11?refresh=wait_for' > /dev/null
-curl -s 'localhost:9200/documents/_count?filter_path=count'
-```
-
-```json
-{"count":10}
-```
-
-The mapping keeps the `views` field, by the way. Deleting the document does not un-guess the type — which is the whole point of this section.
-
-### The types worth knowing
-
-- **Numbers**: `long`, `integer`, `short`, `byte`, `double`, `float`, `half_float`, and `scaled_float` (fixed-point stored as an integer with a scaling factor — the right choice for prices). Pick the smallest that fits; it directly shrinks the index.
-- **Time**: `date`, which accepts many input formats and stores epoch milliseconds internally.
-- **Structure**: `object` (flattened to dotted paths like `author.name`) and `nested` (below, and it exists to solve one specific surprising problem).
-- **Geo**: `geo_point`, `geo_shape` — distance queries and geographic aggregations.
-- **Vectors**: `knn_vector`, the entry point to everything in Chapter 3.
-- And the two everyone gets wrong at least once: `text` and `keyword`.
-
-### `text` vs `keyword`, or: the mistake everybody makes
-
-- **`text`** is **analysed**: chopped into terms, lowercased, stemmed; each term indexed separately.
-- **`keyword`** is **not analysed**: the whole value becomes exactly one term, byte for byte.
-
-Take a title like `"Senior Java Engineer"`.
-
-**As `text`**, the index receives three terms:
-
-```
-senior → [d]     java → [d]     engineer → [d]
-```
-
-- Search `java engineer` → **matches** (both terms present).
-- Search `Java` → **matches** (the query is lowercased the same way the document was).
-- Exact lookup for the string `"Senior Java Engineer"` → **no match**. There is no term equal to that string. It was taken apart, and the whole was never stored.
-
-**As `keyword`**, the index receives one term:
-
-```
-Senior Java Engineer → [d]
-```
-
-- Exact lookup → **matches**.
-- Sort by it → works (it has doc values: one value per document).
-- Aggregate "top 10 job titles" → works.
-- Search `java` → **no match**. The only term is the full string, and `java ≠ Senior Java Engineer`.
-
-See both in the lab. `title` is `text`, `team` is `keyword`:
-
-```bash
-# term query on a TEXT field — the exact string was never stored as a term
 curl -s 'localhost:9200/documents/_search?filter_path=hits.total' -H 'Content-Type: application/json' -d '
 { "query": { "term": { "title": "Kafka partitions are ordered" } } }'
+# → {"hits":{"total":{"value":0,"relation":"eq"}}}
 ```
 
-```json
-{"hits":{"total":{"value":0,"relation":"eq"}}}
-```
+Zero hits, no error: that is what "OpenSearch is broken" usually looks like. The same `term` query on `team` for `platform` returns 4.
 
-```bash
-# term query on a KEYWORD field — exact bytes, exact match
-curl -s 'localhost:9200/documents/_search?filter_path=hits.total' -H 'Content-Type: application/json' -d '
-{ "query": { "term": { "team": "platform" } } }'
-```
-
-```json
-{"hits":{"total":{"value":4,"relation":"eq"}}}
-```
-
-Zero hits, no error, no hint. That first response is what "OpenSearch is broken" usually looks like.
-
-Neither type is right in general. **Which you want depends on the query, not on the field.** So have both, through a **multi-field**:
+**Which type you want depends on the query, not the field**, so have both through a **multi-field**:
 
 ```json
 "title": {
   "type": "text",
-  "fields": {
-    "keyword": { "type": "keyword", "ignore_above": 256 }
-  }
+  "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
 }
 ```
 
-One field in your JSON, two fields in the index. You search `title`; you sort and aggregate on `title.keyword`. This is exactly what dynamic mapping produces for a string by default — which is why things often work *before* you write an explicit mapping and break *after*: you removed a multi-field you did not know was there. (It is also why the `views` field above came back with a `.keyword` sub-field you never asked for.)
+Search `title`; sort and aggregate on `title.keyword`. Dynamic mapping produces exactly this for strings (hence `views.keyword`), which is why things often break *after* you write an explicit mapping: you removed a multi-field you did not know was there.
 
-> **The diagnostic shortcut worth memorising: a search returns nothing and you are certain it should match → check whether you ran a `term` query against a `text` field.** That one mistake accounts for a remarkable share of search bug reports.
+> **Diagnostic shortcut: a search returns nothing and you are certain it should match → check for a `term` query against a `text` field.**
 
 ### The nested-object trap
 
-This one produces **silently wrong answers** rather than errors, which is why it earns the space.
-
-Suppose a Lantern document lists its contributors:
+This one gives **silently wrong answers**. A document lists its contributors:
 
 ```json
 { "contributors": [ { "name": "asha",  "edits": 120 },
                     { "name": "priya", "edits": 3   } ] }
 ```
 
-Mapped as a plain `object`, OpenSearch flattens it. The index does not hold two contributor objects. It holds two multi-valued fields:
+As a plain `object`, it is flattened into `contributors.name → [asha, priya]` and `contributors.edits → [120, 3]`. **The pairing is gone**, so "a contributor named priya with more than 100 edits" matches. The fix is `"type": "nested"`, which stores each sub-object as a hidden document and needs a `nested` query. It is slower, so use it only when you need the correlation.
 
-```
-contributors.name  → [asha, priya]
-contributors.edits → [120, 3]
-```
+### The rule
 
-**The pairing is gone.** Now query "a contributor named priya with more than 100 edits":
-
-- does this document contain the name `priya`? Yes.
-- does it contain an `edits` value above 100? Yes — 120.
-- → **match.**
-
-Which is wrong. Priya made three edits. The two facts came from different objects and the index could not tell. Nothing errors. You may not notice for a year.
-
-The fix is `"type": "nested"`, which tells Lucene to store each sub-object as its own hidden document, preserving the correlation, and to query it with a `nested` query. The cost is real — more documents under the hood, slower queries, a cap on how many you can have — so use it when you need the correlation and not otherwise. But *know which one you need*, because the failure mode is silence.
-
-### A few other mapping controls
-
-- `index: false` — keep it in `_source`, do not make it searchable. Saves space on display-only fields.
-- `doc_values: false` — no columnar structure. Saves space on fields you never sort or aggregate on.
-- `copy_to` — duplicate several fields into one catch-all, giving a cheap "search everything" target.
-- `ignore_above` — on a keyword, silently skip indexing values longer than N characters, so a thousand-character string never becomes a term.
-
-And the rule that the whole of §2.10 exists to work around:
-
-> **You cannot change the type of an existing field.** The inverted index and doc values were built to the old type; there is no reinterpreting them. Changing a mapping means creating a new index and copying the data across. Which is why aliases exist.
+> **You cannot change the type of an existing field.** Changing a mapping means a new index and a copy, which is why aliases (§2.10) exist.
 
 ---
 
-## §2.5 Analysis: how text becomes terms
+## 2.5 Analysis: how text becomes terms
 
-### The wall
-
-Search your lab for "ordering". Two documents are obviously about ordered delivery in Kafka.
+Search the lab for "ordering". d1 is titled "Kafka partitions are **ordered**".
 
 ```bash
 curl -s 'localhost:9200/documents/_search?filter_path=hits.total' -H 'Content-Type: application/json' -d '
@@ -684,134 +361,66 @@ curl -s 'localhost:9200/documents/_search?filter_path=hits.total' -H 'Content-Ty
 {"hits":{"total":{"value":0,"relation":"eq"}}}
 ```
 
-Nothing. d1 is titled "Kafka partitions are **ordered**" and it did not match "ordering". This is the most common bug in search, and the section exists to make it a five-second diagnosis instead of an afternoon.
+Nothing. This is the most common bug in search.
 
-### What analysis is
+**Analysis** is the pipeline that turns a string into indexed terms. The crucial fact:
 
-**Analysis** is the pipeline that turns a string into the terms stored in the inverted index. The crucial fact:
-
-> It runs **twice** — at index time on the document, and at query time on the query string — and both must produce **compatible terms**, because matching happens on terms and on nothing else.
-
-Index `"Kafka"`, lowercase it to `kafka`. Query `"Kafka"` without lowercasing and you look up the term `Kafka`. `Kafka ≠ kafka`. Zero results, while you stare at the document and swear it is right there. Nearly every "why doesn't this match" bug is this, in some costume.
+> It runs **twice**, on the document at index time and on the query at query time, and both must produce **compatible terms**, because matching happens on terms and nothing else.
 
 ### Three stages
 
 ```
   "The Café's WiFi-router is <b>broken</b>!"
-        │
-        ▼   1. CHARACTER FILTERS  (zero or more, on the raw string)
-            html_strip → "The Café's WiFi-router is broken!"
-        │
-        ▼   2. TOKENIZER  (exactly one; splits into tokens)
-            standard → [The, Café's, WiFi, router, is, broken]
-        │
-        ▼   3. TOKEN FILTERS  (zero or more, applied in order)
-            lowercase    → [the, café's, wifi, router, is, broken]
-            asciifolding → [the, cafe's, wifi, router, is, broken]
-            stemmer      → [the, cafe, wifi, router, is, broken]
-        │
-        ▼
-  these terms go into the inverted index
+        │  1. CHARACTER FILTERS (zero or more, on the raw string)
+        ▼     html_strip   → "The Café's WiFi-router is broken!"
+        │  2. TOKENIZER (exactly one)
+        ▼     standard     → [The, Café's, WiFi, router, is, broken]
+        │  3. TOKEN FILTERS (zero or more, in order)
+        ▼     lowercase    → [the, café's, wifi, router, is, broken]
+              asciifolding → [the, cafe's, wifi, router, is, broken]
+              stemmer      → [the, cafe, wifi, router, is, broken]
 ```
 
-**Character filters** work on the raw string before anything is split: strip HTML, replace characters, apply a regex.
+**Tokenizers** split, one per analyzer:
 
-**The tokenizer** does the splitting, and there is exactly one:
+| Tokenizer | Behaviour | Use |
+|---|---|---|
+| `standard` | Unicode word boundaries | essentially all prose |
+| `whitespace` | split on spaces only | when `WiFi-router` should stay one token |
+| `ngram` | every substring: `java` (2–4) → `ja, av, va, jav, ava, java` | substring match; index grows several times |
+| `edge_ngram` | prefixes only: `java` → `j, ja, jav, java` | autocomplete |
 
-- `standard` — Unicode word-boundary rules. Right for essentially all prose.
-- `whitespace` — split on spaces only, so `WiFi-router` stays one token.
-- `keyword` — emit the whole input as one token. This is literally how a `keyword` field behaves.
-
-Two more deserve attention.
-
-**`ngram`** emits every substring within a length range. `java` with min=2, max=4 becomes:
-
-```
-ja, av, va, jav, ava, java
-```
-
-Six terms for one word. Now a search for `av` finds it — substring matching, and some typo tolerance — at the cost of an index several times larger, because every word explodes. Use it deliberately, on small fields.
-
-**`edge_ngram`** emits only **prefixes**. `java` becomes:
-
-```
-j, ja, jav, java
-```
-
-This is the machinery for **autocomplete**: index a title this way and, when the user has typed `jav`, that prefix is a real term in the index and the lookup is instant.
-
-But here is the part people get wrong, and it is worth slowing down for. Analysis runs at query time too. If you use `edge_ngram` on *both* sides, the query `java` becomes `[j, ja, jav, java]`, and the term `j` matches **every word beginning with j** in the corpus — javascript, jenkins, jira, jupyter. Your autocomplete returns nonsense.
-
-The fix is to analyse the two sides differently:
-
-```json
-"title_ac": {
-  "type": "text",
-  "analyzer":        "edge_ngram_analyzer",   ← index time: all prefixes
-  "search_analyzer": "standard"               ← query time: the word as typed
-}
-```
-
-Index side produces `j, ja, jav, java`; query side produces just `jav`; `jav` matches. **This is the canonical reason `search_analyzer` exists.**
+The `edge_ngram` trap: if the query side uses it too, `java` becomes `[j, ja, jav, java]`, and `j` matches every word starting with j. So set `"analyzer"` to the edge-ngram analyzer (index time: all prefixes) and `"search_analyzer"` to `standard` (query time: the word as typed). **This is the canonical reason `search_analyzer` exists.**
 
 ### Token filters
 
-- **`lowercase`** — you will always want it.
-- **`asciifolding`** — `café → cafe`, `Zürich → Zurich`. Enormous for names and any international corpus, because users do not type accents.
-- **`stop`** — removes "the", "a", "of". This mattered when disks were small and is mostly a mistake now, for two reasons. BM25 (§2.9) already gives near-zero weight to words that appear everywhere, so it solves nothing; and it **breaks phrase queries**. Search for `"to be or not to be"` in a stopword-stripped index and you are searching for the empty set. Same for "The Who", "The The", and a surprising number of product names. Leave stopwords in unless you have a specific reason.
-- **`stemmer`** — reduce words to a root: `running`, `runs`, `ran` → `run`. This raises **recall** (you find more of the relevant documents) at some cost to **precision** (you also find some irrelevant ones), because distinct words sometimes collapse: an aggressive stemmer turns both `universal` and `university` into `univers`. They come in strengths — `porter_stem` is enthusiastic, `minimal_english` only strips plurals, `kstem` and `light_english` sit in between. If users report obviously wrong words in their results, suspect the stemmer.
-
-  *(Precision and recall, since the chapter uses them freely: **precision** = of what I returned, how much was relevant. **Recall** = of everything relevant, how much did I return. Push one and the other usually sags.)*
-
-- **`synonym` / `synonym_graph`** — make `js`, `javascript`, and `ecmascript` interchangeable. There is a placement decision worth understanding:
-  - **Index time**: free at query time, but changing the list requires reindexing the whole corpus, *and* expanding synonyms into the index distorts the term statistics that ranking depends on — suddenly `javascript` appears in far more documents than it really does, so IDF discounts it.
-  - **Query time**, via `synonym_graph` in a `search_analyzer`: costs a little per query, editable whenever you like.
-
-  Prefer query time. The operational flexibility is worth far more than the microseconds.
+- **`lowercase`**: always. **`asciifolding`**: `café → cafe`; users do not type accents.
+- **`stop`**: removes "the", "a", "of". Mostly a mistake now: BM25 (§2.9) already weights common words near zero, and stopwords **break phrase queries** (`"to be or not to be"` becomes the empty set).
+- **`stemmer`**: `running`, `runs` → `run`. This raises **recall** (of everything relevant, how much you returned) at some cost to **precision** (of what you returned, how much was relevant): an aggressive stemmer merges `universal` and `university`. Strengths run from `porter_stem` to `minimal_english` (plurals only).
+- **`synonym_graph`**: make `js` and `javascript` interchangeable. Apply it at query time, in a `search_analyzer`: at index time, every change means reindexing and the expansion distorts IDF.
 
 ### `_analyze`, and the five-second diagnosis
 
-This is the most useful endpoint in the product, and it does exactly one thing: it shows you the terms.
+The most useful endpoint in the product shows you the terms:
 
 ```bash
 curl -s 'localhost:9200/documents/_analyze?filter_path=tokens.token' -H 'Content-Type: application/json' -d '
 { "field": "title", "text": "Kafka partitions are ordered" }'
 ```
 
-```json
-{"tokens":[{"token":"kafka"},{"token":"partitions"},{"token":"are"},{"token":"ordered"}]}
-```
-
-```bash
-curl -s 'localhost:9200/documents/_analyze?filter_path=tokens.token' -H 'Content-Type: application/json' -d '
-{ "field": "title", "text": "ordering" }'
-```
-
-```json
-{"tokens":[{"token":"ordering"}]}
-```
-
-Put them side by side and the bug from the top of this section is *visible*:
+Run it on the document text and on the query, and compare:
 
 ```
 document terms:  [kafka, partitions, are, ordered]
 query terms:     [ordering]
-                            ↑ no term in common. Not a ranking problem — not a candidate.
+                  ↑ no term in common. Not ranked low: not a candidate.
 ```
 
-The default analyzer lowercases and splits, and that is all. It does not stem. `ordered` and `ordering` are two unrelated strings to it, exactly as they were to PostgreSQL in §2.1.
-
-**The debugging recipe** — mechanical, works nearly every time. A document should match and does not:
-
-1. `_analyze` the document's text.
-2. `_analyze` the query's text.
-3. Put the two lists side by side.
-
-In the overwhelming majority of cases the mismatch is immediately visible: a stemmer applied on one side only, a stopword removed, a case difference, an accent, a hyphen split differently than you assumed. The invisible becomes something you can look at, and you stop guessing.
+The default analyzer does not stem. **The recipe** when a document should match and does not: `_analyze` the document text, `_analyze` the query, compare. The mismatch is almost always visible: a one-sided stemmer, a stopword, case, an accent, a hyphen.
 
 ### Fixing it: a custom analyzer
 
-Build one. Strip HTML, split on word boundaries, lowercase, fold accents, and stem with Porter:
+Build one that strips HTML, lowercases, folds accents and stems:
 
 ```bash
 curl -s -X PUT localhost:9200/documents_v2 -H 'Content-Type: application/json' -d '
@@ -842,9 +451,7 @@ curl -s -X PUT localhost:9200/documents_v2 -H 'Content-Type: application/json' -
 }'
 ```
 
-Note the `title` multi-field: `title` for searching, `title.keyword` for sorting and aggregating — the §2.4 fix for the error you saw at the end of §2.2.
-
-Check the analyzer before you trust it, which is the whole point of `_analyze`:
+The `title.keyword` multi-field fixes §2.2's sort error. Check the analyzer before trusting it:
 
 ```bash
 curl -s 'localhost:9200/documents_v2/_analyze?filter_path=tokens.token' -H 'Content-Type: application/json' -d '
@@ -856,13 +463,9 @@ curl -s 'localhost:9200/documents_v2/_analyze?filter_path=tokens.token' -H 'Cont
            {"token":"and"},{"token":"the"},{"token":"cafe'"},{"token":"server"}]}
 ```
 
-`Ordered` and `ordering` both became `order`, which is the fix we wanted. The `<b>` tags are gone. `delivery` became `deliveri`, which is not a word — stems do not have to be words, they only have to be *consistent*, because both sides of the match go through the same pipeline.
+`Ordered` and `ordering` both became `order`. `deliveri` is not a word and need not be: stems only have to be *consistent*. But `cafe'` is a bug: the tokenizer kept `Café's` whole, the stemmer stripped the `s`, and a user typing `cafe` will never match. Found in four seconds; fixed with an `apostrophe` token filter before the stemmer, or a `char_filter` removing `'`.
 
-And then there is `cafe'`. The accent folded as expected, but the possessive did not: the `standard` tokenizer keeps `Café's` as one token, the stemmer strips the `s`, and you are left with a term ending in an apostrophe. Nobody will ever type that. A user searching for `cafe` will not match it.
-
-That is a small bug, sitting in an analyzer that looked obviously correct when you read it, found in four seconds by looking at the output. It is exactly why this endpoint is worth more than the rest of the tooling combined — and the fix is a `char_filter` mapping `'` to nothing, or an `apostrophe` token filter before the stemmer.
-
-Copy the corpus across and try the failing query again:
+Copy the corpus across and retry:
 
 ```bash
 curl -s -X POST 'localhost:9200/_reindex?refresh=true' -H 'Content-Type: application/json' -d '
@@ -876,83 +479,53 @@ curl -s 'localhost:9200/documents_v2/_search?filter_path=hits.hits._id' -H 'Cont
 {"hits":{"hits":[{"_id":"d1"},{"_id":"d2"}]}}
 ```
 
-Both documents, from a word neither of them contains. That is stemming earning its keep — and §2.10 will show you how to make that swap from `documents` to `documents_v2` without your application noticing.
-
-**Use `documents_v2` from here on.** It is what Lantern actually runs.
+Both documents, from a word neither contains. **Use `documents_v2` from here on**; §2.10 shows how to swap without the application noticing.
 
 ---
 
-## §2.6 What happens when you write
+## 2.6 What happens when you write
 
-We can now trace a write, and resolve two mysteries: why the primary shard count is immutable, and why a document you just successfully indexed cannot be found.
+Two mysteries: why the primary count is immutable, and why a document you just indexed cannot be found.
 
 ### Routing, and the immutable shard count
 
 ```
-1. The client sends the document to any node → that node becomes the coordinator.
-
-2. The coordinator computes which shard owns it:
-
-       shard = hash(routing) % number_of_primary_shards
-
-   where `routing` defaults to the document's _id.
-
-3. It forwards the document to the node holding that primary shard.
-
-4. The primary writes it into an in-memory buffer,
-   and appends the operation to the TRANSLOG.
-
-5. The primary forwards it to all in-sync replicas, in parallel.
-
-6. The replicas acknowledge → the primary acknowledges to the client.
+1. Any node receives the document and becomes the coordinator.
+2. It picks the shard:  shard = hash(routing) % number_of_primary_shards
+   (routing defaults to _id), and forwards to that primary.
+3. Primary writes to an in-memory buffer and appends to the TRANSLOG.
+4. Primary forwards to all in-sync replicas in parallel.
+5. Replicas acknowledge → primary acknowledges to the client.
 ```
 
-**Step 2 is the answer to the first mystery.** Work it through with real numbers. Lantern has 12 primaries, and suppose `hash("d-1001") = 90211`:
+**Step 2 explains the first mystery.** Lantern has 12 primaries; suppose `hash("d-1001") = 90211`:
 
 ```
-90211 % 12 = 7     → document d-1001 lives on shard 7
+90211 % 12 = 7     → d-1001 lives on shard 7
+90211 % 13 = 4     → after growing to 13 shards, the formula says shard 4
 ```
 
-Now grow the index to 13 shards:
+The document is still on shard 7, so a `GET` asks shard 4 and finds nothing. **It is not gone, it is unfindable**, and changing the divisor does this to nearly every document at once: §1.3's modulus problem again.
 
-```
-90211 % 13 = 4     → the formula now says shard 4
-```
+**Step 5**: replication is **synchronous**. Success means the document is on the primary *and* its in-sync replicas, so one slow replica raises indexing latency.
 
-The document is physically still on shard 7. A `GET /documents/d-1001` computes 4, asks shard 4, and shard 4 has never heard of it. **The document is not gone — it is unfindable.** And this happens to *nearly every document at once*, because changing the divisor reshuffles almost everything.
-
-That is §1.3's modulus problem arriving in a new costume, and it is why the primary count is frozen at creation, and why §2.10 has a whole apparatus of reindexing and aliases.
-
-**Step 6 is worth noticing too.** OpenSearch replicates **synchronously**: when you get a success response, the document is on the primary *and* on its in-sync replicas, not queued somewhere hopeful. That is the durable side of the §1.4 trade-off, and it is why indexing latency rises when one replica gets slow. (A related setting, `wait_for_active_shards`, controls how many copies must be *available* before the write is even attempted.)
-
-### The three different meanings of "written to disk"
-
-This is where most people's mental model is wrong, and getting it exactly right determines both correctness and performance. Three operations, three schedules, three different guarantees. Do not blur them.
+### Three meanings of "written to disk"
 
 | Operation | Default schedule | What it guarantees |
 |---|---|---|
-| **Refresh** | every **1 second** | documents become **visible to search** |
-| **Flush** | ~every 30 min, or translog > 512 MB | segments `fsync`ed → **durable in segment form** |
+| **Refresh** | every **1 second** | buffer becomes a new segment → **visible to search** (may still be only in filesystem cache) |
+| **Flush** | ~every 30 min, or translog > 512 MB | segments `fsync`ed, fresh translog → **durable in segment form** |
 | **Translog fsync** | **every request** | the acknowledged write is **crash-safe** |
 
-**Refresh** turns the in-memory buffer into a new segment and opens that segment for searching. Note what it does *not* promise: the segment may still live only in the filesystem cache. Refresh is about **visibility**, not durability.
+The translog is §1.6's write-ahead log, so a power cut after the acknowledgement loses nothing. (`index.translog.durability: async` trades a five-second loss window for throughput.) Hence the most surprising property:
 
-**Flush** `fsync`s segments to physical disk and starts a fresh translog. Durability, in segment form.
+> **A document that has been successfully indexed (acknowledged, durable, crash-safe) is not searchable for up to one second.**
 
-**Translog fsync** (`index.translog.durability: request`) forces the operation log to disk *before* your write is acknowledged. This is the write-ahead log of §1.6 doing exactly its usual job: if the machine loses power one millisecond after the acknowledgement, the document is recoverable from the log even though no segment exists yet. You can relax it to `async` (every five seconds) for a real throughput gain and a five-second window of possible loss on a hard crash.
-
-From which follows the single most surprising property of OpenSearch:
-
-> **A document that has been successfully indexed — acknowledged, durable, crash-safe — is not searchable for up to one second.**
-
-It is on disk. It will survive a power cut. And a search will not find it, because the *segment* it lives in has not been created yet. OpenSearch is **near real-time**, not real-time, and this is deliberate: creating a segment is not free, and doing it once a second instead of once per document is the difference between thousands of writes per second and dozens.
-
-Watch it happen. Index a document and immediately search for it:
+OpenSearch is **near real-time**, deliberately: a segment per second rather than per document is the difference between thousands of writes a second and dozens. Watch it on a throwaway index:
 
 ```bash
 curl -s -X PUT localhost:9200/nrt_demo -H 'Content-Type: application/json' -d '
 { "settings": { "number_of_shards": 1, "number_of_replicas": 0 } }' > /dev/null
-
 curl -s -X POST 'localhost:9200/nrt_demo/_doc/d99' -H 'Content-Type: application/json' -d '
 { "title": "Watermarks in Flink" }'
 curl -s 'localhost:9200/nrt_demo/_search?filter_path=hits.total' -H 'Content-Type: application/json' -d '
@@ -960,133 +533,81 @@ curl -s 'localhost:9200/nrt_demo/_search?filter_path=hits.total' -H 'Content-Typ
 ```
 
 ```json
-{"_index":"nrt_demo","_id":"d99","_version":1,"result":"created",
- "_shards":{"total":1,"successful":1,"failed":0},"_seq_no":0,"_primary_term":1}
+{"_index":"nrt_demo","_id":"d99","_version":1,"result":"created",...}
 {"hits":{"total":{"value":0,"relation":"eq"}}}
 ```
 
-Created, acknowledged, zero hits. Wait a second, run the search again, and it is there:
+Created, acknowledged, zero hits. Two seconds later the same search finds it. Nothing was fixed; a timer fired.
 
-```bash
-sleep 2
-curl -s 'localhost:9200/nrt_demo/_search?filter_path=hits.total' -H 'Content-Type: application/json' -d '
-{ "query": { "match": { "title": "watermarks" } } }'
-curl -s -X DELETE localhost:9200/nrt_demo > /dev/null
-```
-
-```json
-{"hits":{"total":{"value":1,"relation":"eq"}}}
-```
-
-Nothing was fixed in between. A timer fired. This catches everybody, always in the same test.
-
-(The demo used a throwaway index on purpose. Adding d99 to `documents_v2` and deleting it again would leave a tombstone behind, and §2.3 just showed you that a tombstone is not nothing — see the note there about what it does to corpus statistics.)
-
-- **The right fix in a test**: `?refresh=wait_for` — your request blocks until the next scheduled refresh happens. (It is why the bulk load in §2.0 used it.)
-- **The wrong fix**: `?refresh=true` — forces an immediate refresh, creating a tiny segment for *every single write*. In production this destroys indexing throughput and then destroys search latency as the segment count climbs. Do not put it in application code.
-
-The reverse move is genuinely useful. Bulk-loading a large corpus nobody is searching yet? A one-second refresh is pure waste:
-
-```json
-{ "index.refresh_interval": -1, "index.number_of_replicas": 0 }
-```
-
-Load, then restore both. Three- to fivefold speedups are routine.
+| Setting | Effect | Use it |
+|---|---|---|
+| `?refresh=wait_for` | request blocks until the next scheduled refresh | in tests (and the §2.0 bulk load) |
+| `?refresh=true` | forces a tiny segment per write | **never in application code**: kills indexing, then search latency |
+| `refresh_interval: -1`, `number_of_replicas: 0` | no refreshes, no replication | bulk-loading an unsearched corpus, then restore; three- to fivefold speedups are routine |
 
 ### Merging, and the sawtooth
 
-Every refresh makes a segment. A thousand seconds of indexing makes a thousand segments, and **every query must consult every segment**, so latency climbs steadily. Background **merges** combine small segments into larger ones — and, as §2.3 showed, this is also when deleted documents are finally purged and their space returned.
+Every refresh makes a segment and **every query consults every segment**, so background **merges** combine them and purge deleted documents. Merges compete with indexing for I/O, hence the sawtooth in indexing throughput, and SSDs for write-heavy clusters.
 
-Merging is I/O- and CPU-hungry and it runs *concurrently with your indexing*. That is the usual answer to a question that puzzles people: *why does our indexing throughput rise and fall in a sawtooth rather than staying flat?* It is competing with merges. On spinning disks this is severe enough to be a design constraint; solid-state storage is not really optional for a write-heavy search cluster.
-
-`_forcemerge` is the manual override, merging a shard down to a chosen number of segments.
-
-- On a **finished** index — a completed time-series index, the output of a reindex, anything read-only — merging to one segment is a genuine search speedup and reclaims all deleted space.
-- On an **actively written** index it is harmful: you create one enormous segment that future merges must repeatedly rewrite.
+`_forcemerge` to one segment speeds up a **finished**, read-only index and reclaims deleted space. On an **actively written** index it hurts: future merges must keep rewriting one enormous segment.
 
 ---
 
-## §2.7 What happens when you search
+## 2.7 What happens when you search
 
-A search fans out to every relevant shard, in two phases. Understanding the two phases explains two important behaviours.
+A search runs in two phases across every relevant shard:
 
 ```
 PHASE 1 — QUERY
-  The coordinator sends the query to one copy of every shard
-  (primary or replica, whichever is less busy).
-  Each shard runs it locally and returns the top `size`
-  document IDs with their scores — NOT the documents.
-  The coordinator merges those lists into one global top `size`.
+  Coordinator sends the query to one copy of every shard.
+  Each shard returns its top `size` (id, score) pairs, NOT documents.
+  Coordinator merges them into a global top `size`.
 
 PHASE 2 — FETCH
-  The coordinator asks the relevant shards for the _source of
-  just those documents, and returns them to the client.
+  Coordinator fetches _source for just those documents.
 ```
 
-Why split it? With 20 shards and `size=10`, phase 1 moves 200 tiny `(id, score)` pairs, and phase 2 moves exactly 10 full documents. The naive alternative ships 200 *full documents* across the network in order to throw 190 away.
+With 20 shards and `size=10`, that is 200 tiny pairs and 10 documents, instead of 200 full documents with 190 thrown away.
 
 ### Consequence one: deep pagination is a trap
 
-`from=0&size=10` — each of 20 shards returns its local top 10, the coordinator merges 200 candidates and keeps 10. Cheap.
-
-`from=100000&size=10` — page ten thousand. To know the global ranks 100 001 to 100 010, the coordinator needs each shard's top **100 010**, because in principle all of them could come from one shard. So:
+To return global ranks 100 001–100 010 (`from=100000&size=10`), the coordinator needs each shard's top **100 010**, since they could all come from one shard:
 
 ```
-20 shards × 100 010 scored hits  = 2 000 200 entries built and shipped
-coordinator sorts 2 000 200 entries
+20 shards × 100 010 scored hits = 2 000 200 entries built, shipped, sorted
 returns 10
 ```
 
-The cost grows **linearly with page depth** and **multiplicatively with shard count**. This is why OpenSearch refuses past ten thousand results by default. It is not an arbitrary limit; it is a guardrail at the edge of a cliff.
+Cost grows with depth times shard count, which is why OpenSearch refuses past ten thousand results by default. Use **`search_after`**: pass the last hit's sort values (e.g. `["2026-03-01T00:00:00Z", "d1"]`) and each shard seeks straight past them, at constant cost per page.
 
-The correct mechanism is **`search_after`**, a cursor: you pass the sort values of the last hit on the previous page and each shard seeks straight past them.
-
-```json
-{ "size": 10,
-  "sort": [ { "updated_at": "desc" }, { "_id": "asc" } ],
-  "search_after": [ "2026-03-01T00:00:00Z", "d1" ] }
-```
-
-Each shard is now asked "give me the first 10 after this point" — constant cost per page, no matter how deep. For exporting an entire result set, the **point-in-time** API (or the older scroll API) holds a consistent snapshot of the index while you page through it.
-
-And the product lesson underneath: nobody goes to page ten thousand. Nobody has ever gone to page ten thousand. If your product needs deep pagination, what it probably needs is better filters.
+For full exports, the **point-in-time** API (or older scroll API) holds a consistent snapshot. And nobody has ever gone to page ten thousand: a product that "needs" it needs better filters.
 
 ### Consequence two: relevance is slightly approximate
 
-Each shard is an independent Lucene index with its own statistics (§2.3). Ranking depends on **how rare a term is** — and each shard computes that from *its own* documents.
-
-```
-shard 3: "kafka" in 2% of its documents  → treats it as rare    → scores it high
-shard 7: "kafka" in 6% of its documents  → treats it as common  → scores it lower
-```
-
-Two identical documents on different shards get different scores. With plenty of documents per shard, random assignment makes the local percentages converge on the global one and this is invisible. With *few* documents per shard — a small index split many ways, or a ten-document test fixture — the effect can be large enough to be baffling. It is precisely why your lab index has one shard.
-
-The fix, when you need it, is `search_type=dfs_query_then_fetch`, which adds a preliminary round to collect global term statistics before scoring. It costs an extra round trip and is rarely necessary in production. It is worth knowing about when someone shows you two nearly identical documents with wildly different scores in a small index.
+Each shard computes term rarity from *its own* documents: if "kafka" is in 2% of shard 3 but 6% of shard 7, identical documents score differently on each. With many documents per shard the rates converge; with few (a test fixture split many ways) the effect is baffling, hence the lab's single shard. `search_type=dfs_query_then_fetch` collects global statistics first, for an extra round trip; production rarely needs it.
 
 ---
 
-## §2.8 Asking good questions
-
-Now the query language. There is a great deal of it; this section gives you the small number of ideas that carry most of the weight.
+## 2.8 Asking good questions
 
 ### Query context vs filter context
 
-The most important distinction in the query DSL, and the easiest performance win available.
+The most important distinction in the query language:
 
-- **Query context** asks *how well does this document match?* → it computes a score. **Not cacheable**, because the score depends on this exact query.
-- **Filter context** asks *does this document match, yes or no?* → no score. **Cacheable**, as a bitset — one bit per document — reusable by every future query.
+| | Query context | Filter context |
+|---|---|---|
+| Asks | *how well* does it match? | *does* it match, yes or no? |
+| Scores | yes | no |
+| Cacheable | no (depends on this query) | yes, as a **bitset**: one bit per document |
 
-The bitset is the point. `status = published` over ten million documents becomes ten million bits, about 1.2 MB, computed once and then reused:
+`status = published` over ten million documents is about 1.2 MB of bits, computed once and reused:
 
 ```
 docs:    d1 d2 d3 d4 d5 d6 d7 d8 d9 d10
-bitset:   1  1  1  1  0  1  1  1  1   1     ← "is this published?"  (d5 is archived)
+bitset:   1  1  1  1  0  1  1  1  1   1     ← d5 is archived
 ```
 
-The next query that filters on `published` recomputes nothing; it ANDs against this.
-
-The `bool` query is where you assemble everything. Run this against the lab:
+The `bool` query combines both:
 
 ```bash
 curl -s 'localhost:9200/documents_v2/_search?filter_path=hits.hits._id,hits.hits._score' -H 'Content-Type: application/json' -d '
@@ -1112,151 +633,75 @@ curl -s 'localhost:9200/documents_v2/_search?filter_path=hits.hits._id,hits.hits
 ]}}
 ```
 
-- `must` — must match **and** contributes to the score. (Every hit mentions a partition.)
-- `filter` — must match, contributes **nothing** to the score, and is cached. (d5 is archived, so it is gone; d3 is from 2024, so it is gone.)
-- `should` — optional; boosts the score when it matches. It is the "…and if it also mentions Kafka, rank it higher" clause, and it is why d2, d1, and d4 all sit above d6, whose title is about Spark.
-- `must_not` — excludes. (d9, the novelist, is on team `misc`.)
+- `must`: must match **and** scores. Every hit mentions a partition.
+- `filter`: must match, scores **nothing**, cached. d5 (archived) and d3 (2024) are gone.
+- `should`: optional, boosts when it matches. That is why the Kafka titles sit above d6.
+- `must_not`: excludes. d9 is on team `misc`.
 
-> **The rule, applied mechanically: every yes-or-no constraint belongs in `filter`, never in `must`.**
+> **Every yes-or-no constraint belongs in `filter`, never in `must`.**
 
-Status, ownership, date ranges, tenancy, booleans, enumerations. None of them should influence *ranking* — a document is not more relevant for being published, it is merely eligible — and all of them are highly cacheable. Moving a clause from `must` to `filter` is a one-line change that frequently halves query latency.
+Being published makes a document eligible, not more relevant, and moving such clauses into `filter` often halves latency.
 
 ### The families of query
 
-**Full-text queries** analyse their input, so the query string goes through the same pipeline the document did.
+**Full-text queries** analyse their input like the document:
 
-- **`match`** — the workhorse. Analyses your input into terms and finds documents containing *any* of them, or all with `"operator": "and"`.
-  ```json
-  { "match": { "body": "kafka ordering" } }
-  ```
-  → terms `[kafka, order]` → documents containing either, ranked by how well (§2.9).
-- **`match_phrase`** — the terms must be adjacent and in order, using the positions from §2.2. A `slop` parameter allows some reordering: `"slop": 2` lets the phrase `"kafka ordering"` match *"ordering in Kafka"*.
-- **`multi_match`** — the same text against several fields. Its `type` matters more than people expect:
-  - `best_fields` (default) — score by the single best-matching field. Right for "find whichever field this matches".
-  - `most_fields` — sum across fields. Right when the *same* text is indexed several ways (exact + stemmed + ngrammed).
-  - `cross_fields` — treat several fields as one merged field. Right for a name or address spread across `first_name`, `last_name`, `city`, because nobody's query lives entirely in one of them.
+- **`match`**: the workhorse. `"kafka ordering"` becomes `[kafka, order]` and finds documents with any of them (all, with `"operator": "and"`).
+- **`match_phrase`**: terms adjacent and in order. `"slop": 2` lets `"kafka ordering"` match "ordering in Kafka".
+- **`multi_match`**: one text, several fields, and its `type` matters:
 
-**Term-level queries** do **not** analyse their input. They look for the exact bytes you gave them, which is why they belong on `keyword` fields, numbers, and dates: `term`, `terms`, `range`, `exists`, `prefix`, `wildcard`, `regexp`, `fuzzy`, `ids`.
+| `type` | Scores by | Right for |
+|---|---|---|
+| `best_fields` (default) | the single best field | "whichever field this matches" |
+| `most_fields` | sum across fields | the same text indexed several ways |
+| `cross_fields` | fields treated as one | a name spread across `first_name`, `last_name`, `city` |
 
-Two warnings about this family.
+**Term-level queries** (`term`, `terms`, `range`, `exists`, `prefix`, `wildcard`, `regexp`, `fuzzy`, `ids`) do **not** analyse input, so they belong on `keyword`, numeric and date fields. Two warnings: `term` on a `text` field quietly finds nothing (§2.4), and a leading-`*` `wildcard` or a `regexp` may scan the whole term dictionary, `LIKE '%...%'` again. Pay for substring matching at index time with ngrams (§2.5).
 
-1. The §2.4 one again: **a `term` query on a `text` field quietly finds nothing.** No error, no hint, zero hits.
-2. **`wildcard` with a leading `*`, and `regexp` in general, may have to scan the entire term dictionary.** `*ordering*` cannot binary-search anything — the same problem as `LIKE '%...%'` in §2.1, arriving through a different door. If you need substring matching, pay for it at index time with ngrams (§2.5) rather than at query time.
-
-**Compound queries** shape relevance:
-
-- `function_score` — multiply the score by a function of the document's own fields. The standard use is a **decay on a date**, so fresher documents rank higher without being the only thing that matters.
-- `boosting` — **demote** rather than exclude, which is usually what you actually want. ("Rank archived documents lower" beats "hide them", because sometimes the archived one is the answer.)
-- `dis_max` — take the *maximum* of the clause scores rather than the sum.
-- `rank_feature` — cheap boosting by a numeric field such as popularity.
-- `script_score` — arbitrary scoring logic. Powerful, and slow.
-
-And **field boosting**, the cheapest relevance improvement in existence:
-
-```json
-"fields": ["title^3", "body"]
-```
-
-A title match counts triple. Almost every search application should do this, and a startling number do not.
+**Compound queries** shape relevance: `function_score` (typically a **date decay**), `boosting` (**demote** rather than exclude, usually what you want), `dis_max`, `rank_feature`, and the slow `script_score`. And **field boosting**, `"fields": ["title^3", "body"]`, is the cheapest relevance win in existence.
 
 ### Sorting
 
-```json
-"sort": [ { "updated_at": "desc" }, "_score", { "_id": "asc" } ]
-```
+Sorting reads **doc values**, so sort on `title.keyword`, not `title`; in `documents_v2`, `{"sort": [{"title.keyword": "asc"}]}` works where §2.2's failed (d7, d4, d1).
 
-Sorting reads **doc values** (§2.2), not the inverted index — which is why it is fast, and why **you cannot sort on a `text` field**: there are no doc values, because analysed terms are not a single sortable value. Sort on the `.keyword` sub-field instead. Your `documents_v2` mapping has one, so this now works where §2.2's did not:
-
-```bash
-curl -s 'localhost:9200/documents_v2/_search?filter_path=hits.hits._id&size=3' -H 'Content-Type: application/json' -d '
-{ "sort": [ { "title.keyword": "asc" } ] }'
-```
-
-```json
-{"hits":{"hits":[{"_id":"d7"},{"_id":"d4"},{"_id":"d1"}]}}
-```
-
-**Always end with a unique tie-breaker such as `_id`.** Without one, documents with equal sort values can come back in a different order on each request, and pagination will duplicate some results and skip others — a bug that looks like a ghost:
-
-```
-page 1 (sorted by date only):  [A, B, C]   ← B and C have the same date
-page 2:                        [C, D, E]   ← C repeated, and something was lost
-```
+**Always end with a unique tie-breaker such as `_id`**, as in `"sort": [{"updated_at": "desc"}, {"_id": "asc"}]`. Otherwise equal values come back in varying order, and pagination repeats some results and skips others.
 
 ### Aggregations
 
-Aggregations are OpenSearch's analytics half: faceted navigation, dashboards, anything shaped like "how many, grouped by what". They read doc values, they nest arbitrarily, and they come in three families.
-
-- **Bucket** — group documents. `terms` gives the top N values of a field (your "top twenty tags" facet); `date_histogram` gives time buckets and is the backbone of every time-series dashboard; plus `range`, `histogram`, `filters`, `nested`, `composite`.
-- **Metric** — compute a number over a bucket: `avg`, `min`, `max`, `sum`, `stats`, `value_count`, `cardinality`, `percentiles`.
-- **Pipeline** — operate on the *output* of other aggregations: `derivative`, `moving_avg`, `cumulative_sum`, and `bucket_selector`, which acts like SQL's `HAVING`.
-
-They compose. Count documents per team, and get each team's most recent edit:
+Aggregations answer "how many, grouped by what" for facets and dashboards. They read doc values and nest freely: **bucket** aggregations group (`terms`, `date_histogram`), **metric** ones compute a number per bucket (`max`, `cardinality`, `percentiles`), and **pipeline** ones work on other aggregations' output (`bucket_selector` is SQL's `HAVING`). Documents per team, with each team's latest edit:
 
 ```bash
 curl -s 'localhost:9200/documents_v2/_search?filter_path=aggregations' -H 'Content-Type: application/json' -d '
-{
-  "size": 0,
-  "aggs": {
-    "by_team": {
+{ "size": 0,
+  "aggs": { "by_team": {
       "terms": { "field": "team", "size": 10 },
-      "aggs": { "latest": { "max": { "field": "updated_at" } } }
-    }
-  }
-}'
+      "aggs": { "latest": { "max": { "field": "updated_at" } } } } } }'
 ```
 
 ```json
 {"aggregations":{"by_team":{
-  "doc_count_error_upper_bound":0,"sum_other_doc_count":0,
+  "doc_count_error_upper_bound":0, ...
   "buckets":[
-    {"key":"platform","doc_count":4,"latest":{"value":1.7723232E12,"value_as_string":"2026-03-01T00:00:00.000Z"}},
-    {"key":"data","doc_count":3,"latest":{"value":1.7710272E12,"value_as_string":"2026-02-14T00:00:00.000Z"}},
-    {"key":"infra","doc_count":2,"latest":{"value":1.7731008E12,"value_as_string":"2026-03-10T00:00:00.000Z"}},
-    {"key":"misc","doc_count":1,"latest":{"value":1.5463008E12,"value_as_string":"2019-01-01T00:00:00.000Z"}}
-  ]}}}
+    {"key":"platform","doc_count":4,"latest":{..."value_as_string":"2026-03-01T00:00:00.000Z"}},
+    {"key":"data","doc_count":3,"latest":{..."value_as_string":"2026-02-14T00:00:00.000Z"}},
+    ...
 ```
 
-Read it as: bucket by team, top 10, and inside each bucket compute the maximum `updated_at`. `"size": 0` says "no documents, only aggregations" and skips the fetch phase entirely, which is a meaningful saving.
-
-Note the two extra fields in that response — `doc_count_error_upper_bound` and `sum_other_doc_count`. They are zero here, and they are why the next heading exists.
+`"size": 0` skips the fetch phase. Note `doc_count_error_upper_bound`: zero here, and the reason for the next heading.
 
 ### Three aggregations that lie to you (usefully)
 
-**`terms` is approximate.** Each shard computes *its own* top N and ships it; the coordinator merges. So picture a value that ranks **eleventh** on every one of twenty shards:
+- **`terms`**: each shard ships only its own top N. A value ranked **eleventh** on each of twenty shards (900 documents each) appears in no response, though with 18 000 documents it may be the true #1. `shard_size` asks each shard for more candidates.
+- **`cardinality`** (distinct count) uses HyperLogLog++: constant memory, roughly one to two percent error. Exact, over fifty million values, is an outage.
+- **`percentiles`** uses t-digest, most accurate at extremes like p99, where you care.
 
-```
-shard 1  top-10: ... (k8s is #11, with 900 docs)
-shard 2  top-10: ... (k8s is #11, with 900 docs)
-...
-shard 20 top-10: ... (k8s is #11, with 900 docs)
+> **At scale, exactness is often unaffordable, and approximation is a legitimate engineering choice**, as long as it is explicit, bounded and understood.
 
-k8s appears in NO shard's response
-→ the coordinator never sees it
-→ yet globally it has 18 000 documents, and is probably the true #1
-```
-
-`doc_count_error_upper_bound` quantifies how wrong the counts could be, and `shard_size` lets you ask each shard for more candidates — say each shard's top 100 to return a global top 10 — trading memory for accuracy. On your one-shard lab the error is exactly zero, which is worth seeing once so that you know what the field is *for*.
-
-**`cardinality`, a distinct count, is approximate.** It uses HyperLogLog++, which estimates the number of distinct values in *constant* memory with roughly one to two percent error. The exact alternative means shipping every distinct value from twenty shards to one coordinator; for a field with fifty million distinct values that is not a query, it is an outage.
-
-**`percentiles` is approximate**, using a structure called t-digest that is cleverly built to be most accurate at the extremes — the p99 — which is exactly where you care.
-
-And here is the principle, which generalises far beyond OpenSearch:
-
-> **At scale, exactness is often unaffordable, and approximation is a legitimate engineering choice rather than a failure.**
-
-Nobody needs to know there were exactly 8 431 947 distinct users rather than "about 8.4 million". What matters is that the approximation is **explicit**, **bounded**, and **understood** — so that nobody builds a billing system on top of a HyperLogLog estimate. Chapter 3 makes the same trade for the same reason with approximate nearest-neighbour search.
-
-**A cost warning.** Aggregations build structures per bucket, per shard, in heap. A deeply nested `terms` aggregation over high-cardinality fields is the single most reliable way to trigger a circuit breaker or an out-of-memory error: 10 000 users × 1 000 URLs × 100 days is a billion buckets, all in memory, all at once. There is a `search.max_buckets` limit for exactly this reason, and when you hit it the right response is to rethink the query, not to raise the limit.
+Just don't build billing on a HyperLogLog estimate. Chapter 3 makes the same trade with approximate nearest-neighbour search. And beware nesting: 10 000 users × 1 000 URLs × 100 days is a billion buckets in heap. When you hit `search.max_buckets`, rethink the query, not the limit.
 
 ---
 
-## §2.9 Relevance: what "best" means
-
-We can now find every matching document. Which one goes first?
-
-### The wall
+## 2.9 Relevance: what "best" means
 
 ```bash
 curl -s 'localhost:9200/documents_v2/_search?filter_path=hits.hits._id,hits.hits._score' -H 'Content-Type: application/json' -d '
@@ -1273,48 +718,31 @@ curl -s 'localhost:9200/documents_v2/_search?filter_path=hits.hits._id,hits.hits
 ]}}
 ```
 
-Two things to notice. **d9 — the novelist — is tied for first.** And d5 scored lower than the rest for a reason you cannot see. The rest of this section is about where those numbers came from, and what you can do about them.
+**d9, the novelist, is tied for first**, and d5 scored lower for a reason you cannot see yet. This section explains both.
 
-### What a score is, and is not
+### A score is relative
 
-Every hit returns a `_score`, a positive float. It is **relative**: meaningful only within the result set of one query. A score of 14.2 does not mean "very relevant". It means "more relevant than the document scoring 9.8, *for this same query*".
+`_score` means something only within one query's results, so "show results scoring above 5" cannot work: `kafka` tops out at 0.69 and `kafka consumer group lag` at 4.84, because four terms' scores are summed. The corpus moves it too: in the lab "the" is in only two titles, so it is *rare* and outscores "kafka". A score is a statement about a corpus, not a document. For "good enough", normalise within the result set, train a model, or use a cross-encoder (§3.7).
 
-This trips up product requirements constantly. You **cannot** write "only show results scoring above 5" and expect sane behaviour, because the scale shifts with query length, term rarity, and corpus statistics:
+### Three signals
 
-```
-query "kafka"                      → top score  0.69   (one term)
-query "kafka consumer group lag"   → top score  4.84   (four terms, scores summed)
-```
+1. **Term frequency: more is better.**
+2. **Inverse document frequency (IDF): rarer is more valuable.** Lucene computes `IDF = ln(1 + (N − n + 0.5) / (n + 0.5))`, with `N` total documents and `n` containing the term:
 
-A threshold of 2 would return everything for the second query and nothing for the first — and the query did not get seven times better, it got three words longer.
+   ```
+   "kafka"  in  5 of 10 docs → ln(2.00) = 0.693
+   "spark"  in  2 of 10 docs → ln(4.40) = 1.482
+   a term   in 10 of 10 docs → ln(1.05) = 0.047
+   ```
 
-The corpus moves the scale too. In a real corpus "the" is in every document, so IDF drives its score to nearly zero. In your ten-document lab "the" appears in exactly two titles, so it is *rare*, and it scores higher than "kafka" does. Same word, same engine, opposite verdict — because a score is a statement about a corpus, not about a document. If you need a notion of "good enough", normalise within the result set, train a model, or use a cross-encoder (§3.7). Not a magic constant.
+   "spark" is worth twice "kafka" and thirty times a term in every document, which is why stopword lists are unnecessary.
+3. **Field length: shorter is stronger evidence.**
 
-### The intuition: three signals
-
-Long before any formula, three observations about what makes a document relevant to a term.
-
-**1. Term frequency — more is better.** A document mentioning "kubernetes" eight times is more likely to be *about* Kubernetes than one mentioning it once in a footnote.
-
-**2. Inverse document frequency — rarer is more valuable.** A term appearing in few documents is enormously more informative than one appearing everywhere. Matching "kubernetes" tells you something; matching "the" tells you nothing.
-
-Lucene's BM25 computes it as `IDF = ln(1 + (N − n + 0.5) / (n + 0.5))`, where `N` is the total number of documents and `n` is the number containing the term. With your ten-document corpus:
-
-```
-"kafka"  in  5 docs → ln(1 + (10−5+0.5)/(5+0.5))    = ln(2.00) = 0.693
-"spark"  in  2 docs → ln(1 + (10−2+0.5)/(2+0.5))    = ln(4.40) = 1.482
-a term   in 10 docs → ln(1 + (10−10+0.5)/(10+0.5))  = ln(1.05) = 0.047
-```
-
-Matching "spark" is worth **twice** as much as matching "kafka" and **thirty times** as much as matching a term that is in every document. Notice what this settles: aggressive stopword removal is unnecessary, because **IDF already weights "the" to nearly zero.** The scoring function solved the problem that stopword lists were invented for.
-
-**3. Field length — shorter is stronger evidence.** Matching "java" in a three-word title is far stronger evidence than matching it once in a five-thousand-word document, where it may be incidental.
-
-Combine the three and you have TF-IDF, which served the field for decades.
+Combined, that is TF-IDF.
 
 ### BM25, and the two things it fixes
 
-Modern OpenSearch uses **BM25**: the same three signals, each handled more carefully. Here is the formula, which I show once and then tell you not to memorise:
+OpenSearch uses **BM25**, the same signals handled more carefully. Shown once, not to be memorised:
 
 ```
                           f(t,d) · (k₁ + 1)
@@ -1322,46 +750,13 @@ score(q,d) = Σ  IDF(t) · ─────────────────�
             t∈q           f(t,d) + k₁ · (1 − b + b·|d|/avgdl)
 ```
 
-`f(t,d)` is how often term t appears in document d; `|d|` is the field's length in terms; `avgdl` is the average field length across the corpus; `k₁` and `b` are constants defaulting to 1.2 and 0.75.
+`f(t,d)` is the term's count in the document, `|d|` the field length, `avgdl` the average field length, and `k₁ = 1.2`, `b = 0.75` by default.
 
-What matters is the two problems it solves, and the arithmetic is where the insight lives.
+**Fix one: term frequency saturates.** Under TF-IDF, a hundred mentions score a hundred times one, so keyword stuffing wins. BM25's fraction (at average length) climbs toward `k₁ + 1`: 1.000 at one mention, 1.375 at two, 2.075 at twenty, 2.081 at twenty-one, never past 2.2. `k₁` sets how fast it saturates.
 
-**Problem one: term frequency must saturate.**
+**Fix two: length normalisation has a dial.** With `avgdl = 100` and one occurrence, a 10-word title scores 1.583, an average field 1.000, and a 1000-word page 0.214: **seven times** less than the title. `b = 0` ignores length, `b = 1` fully normalises, and 0.75 is a tuned compromise; lower it for fields like tag lists where length means nothing.
 
-Under plain TF-IDF, a document containing "kubernetes" a hundred times scores a hundred times higher than one containing it once. Which means keyword stuffing wins, and a page that is nothing but the word "kubernetes" repeated outranks the actual documentation.
-
-Watch BM25's fraction as `f` grows (taking `|d| = avgdl`, so the length term is 1, and `k₁ = 1.2`):
-
-```
-f = 1:    1 × 2.2 / (1 + 1.2)   = 1.000
-f = 2:    2 × 2.2 / (2 + 1.2)   = 1.375      ← +0.375
-f = 3:    3 × 2.2 / (3 + 1.2)   = 1.571      ← +0.196
-f = 5:    5 × 2.2 / (5 + 1.2)   = 1.774
-f = 20:  20 × 2.2 / (20 + 1.2)  = 2.075
-f = 21:  21 × 2.2 / (21 + 1.2)  = 2.081      ← +0.006
-f = ∞:                          → 2.200      ← hard ceiling = k₁ + 1
-```
-
-Numerator and denominator both grow with `f`, so the ratio climbs toward a ceiling of `k₁ + 1` and never passes it. Going from **1 to 2** occurrences gains 0.375. Going from **20 to 21** gains 0.006 — sixty times less. Which matches human judgement exactly: after a few mentions you are convinced, and further repetition carries no information. `k₁` controls how fast it saturates.
-
-**Problem two: length normalisation needs a dial.**
-
-Penalising long documents is right in general, but overdo it and a genuinely comprehensive forty-page guide loses to a one-line stub. `b` interpolates. With `avgdl = 100` words and one occurrence:
-
-```
-title,     |d| = 10:    norm = 1 − 0.75 + 0.75×(10/100)  = 0.325
-                        component = 2.2/(1 + 1.2×0.325)  = 1.583
-
-average,   |d| = 100:   norm = 1.0
-                        component = 2.2/(1 + 1.2×1.0)    = 1.000
-
-long page, |d| = 1000:  norm = 1 − 0.75 + 0.75×10        = 7.75
-                        component = 2.2/(1 + 1.2×7.75)   = 0.214
-```
-
-One mention in a short title is worth **seven times** one mention in a long page. At `b = 0` length is ignored entirely; at `b = 1` scores are fully normalised by length; 0.75 is a tuned compromise. Lowering `b` is occasionally right for fields where length carries no meaning — a list of tags, say, where having more tags should not dilute each one.
-
-**And now the lab numbers make sense.** Titles in your corpus average 3.9 terms. d1, d2, d4, and d9 each have four-term titles containing "kafka" once; d5 ("The Kafka log is append only") has six:
+**Now the lab numbers make sense.** Titles average 3.9 terms; d1, d2, d4 and d9 have four, and d5 has six:
 
 ```
 IDF("kafka") = 0.693,  k₁ = 1.2,  b = 0.75,  avgdl = 3.9
@@ -1370,54 +765,20 @@ d1  |d|=4:  0.693 × 2.2 / (1 + 1.2×(0.25 + 0.75×4/3.9))  = 0.686
 d5  |d|=6:  0.693 × 2.2 / (1 + 1.2×(0.25 + 0.75×6/3.9))  = 0.568
 ```
 
-d5 is not less about Kafka. It just has a longer title, and BM25 reads length as dilution. Every number in that result set is now accounted for — including the fact that d9, about a novelist, is tied for first, because BM25 knows about words and nothing else.
+d5 is not less about Kafka; its longer title reads as dilution. d9 ties for first because BM25 knows words and nothing else. Tuning `k₁` and `b` is a **small** effect; exhaust boosting, analysers and query structure first.
 
-In practice, tuning `k₁` and `b` is a **small** effect. Field boosting, good analysers, and query structure matter far more, and you should exhaust those before touching the similarity parameters.
+**Finding out why.** Add `"explain": true` to a search and each hit returns exactly this arithmetic, labelled (`n = 5`, `N = 10`, `dl = 4`, `avgdl = 3.9`). `GET /documents_v2/_explain/{id}` answers why *one* document scored as it did, or **why it did not match at all**; `"profile": true` gives per-shard timings.
 
-### Finding out why
+### Getting better relevance, by effort-to-reward
 
-Three endpoints eliminate guesswork entirely.
+1. **Boost fields**: `"title^3"`.
+2. **Index the same text several ways** (exact, stemmed, ngrammed) and combine with `multi_match` `most_fields`; exact matches then outrank stemmed ones for free.
+3. **Add a phrase boost**: a `match_phrase` in `should`.
+4. **Decay by recency or popularity**: `function_score` with `gauss`, or cheaper `rank_feature`.
+5. **Learn to rank**: a plugin that reranks the top N with a trained model over features like BM25 score and click-through.
+6. **Add semantic search**: Chapter 3, where the largest modern gains are.
 
-**`"explain": true`** on a search returns, for every hit, a full recursive breakdown of how its score was computed:
-
-```bash
-curl -s 'localhost:9200/documents_v2/_search?filter_path=hits.hits._explanation' -H 'Content-Type: application/json' -d '
-{ "query": { "match": { "title": "kafka" } }, "size": 1, "explain": true }'
-```
-
-```json
-{"hits":{"hits":[{"_explanation":{
-  "value":0.6859519,"description":"weight(title:kafka in 0) [PerFieldSimilarity], result of:",
-  "details":[{"value":0.6859519,"description":"score(freq=1.0), computed as boost * idf * tf from:",
-    "details":[
-      {"value":2.2,"description":"boost"},
-      {"value":0.6931472,"description":"idf, computed as log(1 + (N - n + 0.5) / (n + 0.5)) from:",
-        "details":[{"value":5,"description":"n, number of documents containing term"},
-                   {"value":10,"description":"N, total number of documents with field"}]},
-      {"value":0.44982696,"description":"tf, computed as freq / (freq + k1 * (1 - b + b * dl / avgdl)) from:",
-        "details":[{"value":1.0,"description":"freq, occurrences of term within document"},
-                   {"value":1.2,"description":"k1, term saturation parameter"},
-                   {"value":0.75,"description":"b, length normalization parameter"},
-                   {"value":4.0,"description":"dl, length of field"},
-                   {"value":3.9,"description":"avgdl, average length of field"}]}]}]}}]}}
-```
-
-Every term of the formula, labelled, with the actual numbers. It is extremely verbose and completely definitive — and it is the same arithmetic you just did by hand.
-
-**`GET /documents_v2/_explain/{id}`** with a query body answers the more focused question: why did *this specific document* score what it did — or, crucially, **why did it not match at all**. When someone says "this document should be the top result and it isn't even in the list", this is the endpoint that answers.
-
-**`"profile": true`** gives a per-shard timing breakdown of query execution. That one is for performance rather than relevance, but it lives in the same toolbox.
-
-### Getting better relevance, roughly by effort-to-reward
-
-1. **Boost your fields.** `"title^3"`. One line of configuration.
-2. **Index the same text several ways** — exact, stemmed, ngrammed — as multi-fields, and combine them with `multi_match` and `most_fields`. Exact matches then naturally outrank stemmed ones, because they match *more sub-fields*, which is a lovely property to get for free.
-3. **Add a phrase boost.** Put a `match_phrase` clause in `should`. Documents where the query words actually appear adjacent get lifted above documents that merely contain them all somewhere.
-4. **Decay by recency or popularity** — `function_score` with a `gauss` decay, or the cheaper `rank_feature`. For Lantern, a wiki page edited last week is probably more useful than an equally relevant one last touched in 2017.
-5. **Learn to rank.** OpenSearch has a Learning to Rank plugin that takes your top N results and reranks them with a trained gradient-boosted model over features you define — BM25 score, recency, click-through rate, author authority. A real step up in quality, and a real step up in machinery.
-6. **Add semantic search.** That is Chapter 3, and it is where the largest modern gains are.
-
-Here are the first three, together, on the lab. Watch d9 fall:
+The first three together. Watch d9 fall:
 
 ```bash
 curl -s 'localhost:9200/documents_v2/_search?filter_path=hits.hits._id,hits.hits._score' -H 'Content-Type: application/json' -d '
@@ -1436,96 +797,54 @@ curl -s 'localhost:9200/documents_v2/_search?filter_path=hits.hits._id,hits.hits
 {"hits":{"hits":[
   {"_id":"d1","_score":7.481207},
   {"_id":"d2","_score":6.4565296},
-  {"_id":"d9","_score":2.0578558},
-  {"_id":"d4","_score":2.0578558},
-  {"_id":"d5","_score":1.7040696}
-]}}
+  {"_id":"d9","_score":2.0578558}, ...
 ```
 
-d1 and d2 now sit far above d9 — a factor of three, where a moment ago it was a four-way tie for first. "ordering" stems to `order`, which d9 does not contain at all, and the title boost multiplies the gap. The novelist did not stop matching. He stopped *winning*, which is the only thing that matters in a ranked list.
+"ordering" stems to `order`, which d9 lacks, and the title boost widens the gap to a factor of three. The novelist did not stop matching; he stopped *winning*, which is all that matters in a ranked list.
 
 ### Measuring it, which you must do first
 
-I have listed six ways to improve relevance, and here is the part to be emphatic about:
+> **Without measurement, you cannot tell whether any of those changes helped.**
 
-> **Without measurement, you cannot tell whether any of them helped.**
+A title boost helps some queries and hurts others. Build a **judgment list**: queries with graded relevant documents (`"kafka ordering"` → d1 perfect, d2 good, d5 acceptable), from click logs, human ratings, or a language model. Then measure:
 
-Relevance work without evaluation is not engineering. It is a sequence of plausible-sounding changes whose net effect is unknown and quite possibly negative. And it is genuinely unknowable by intuition: boosting titles threefold helps some queries and hurts others, and no amount of staring at one example tells you the balance.
+| Metric | Meaning | Example |
+|---|---|---|
+| **Precision@k** | fraction of the top k that is relevant | 6 relevant in top 10 → 0.6 |
+| **Recall@k** | fraction of all relevant documents in the top k | 20 exist, 6 in top 10 → 0.3 |
+| **MRR** | 1 / rank of first relevant result, averaged | first at rank 3 → 0.333 |
+| **nDCG@k** | graded relevance, discounted by position | **the standard headline metric; report this one** |
 
-So build a **judgment list**: a set of queries and, for each, which documents are relevant.
-
-```
-query "kafka ordering"     → relevant: d1 (perfect), d2 (good), d5 (acceptable)
-query "spark partitions"   → relevant: d6 (perfect), d3 (good)
-```
-
-Mine it from click logs, have humans rate a few hundred query-document pairs, or generate it synthetically with a language model. Then measure:
-
-- **Precision@k** — of the top k results, what fraction were relevant? (Top 10, six relevant → 0.6.)
-- **Recall@k** — of all the relevant documents that exist, what fraction appeared in the top k? (Twenty exist, six in the top 10 → 0.3.)
-- **MRR**, mean reciprocal rank — one divided by the position of the *first* relevant result, averaged over queries. First relevant at position 3 → 0.333. The right metric when there is essentially one correct answer.
-- **nDCG@k**, normalised discounted cumulative gain — handles *graded* relevance (perfect / good / acceptable / bad) and discounts by position, so putting the best result first is rewarded and burying it at rank 9 is penalised. **The standard headline metric for ranked retrieval, and the one to report.**
-
-OpenSearch's **Rank Evaluation API**, `_rank_eval`, computes these against a judgment set for you:
+The **Rank Evaluation API** computes these for you:
 
 ```bash
 curl -s 'localhost:9200/documents_v2/_rank_eval' -H 'Content-Type: application/json' -d '
-{
-  "requests": [
-    { "id": "kafka_ordering",
-      "request": { "query": { "multi_match": { "query": "kafka ordering",
-                                               "fields": ["title^3","body"] } } },
-      "ratings": [ { "_index": "documents_v2", "_id": "d1", "rating": 3 },
-                   { "_index": "documents_v2", "_id": "d2", "rating": 2 },
-                   { "_index": "documents_v2", "_id": "d9", "rating": 0 } ] }
-  ],
-  "metric": { "dcg": { "k": 10, "normalize": true } }
-}'
+{ "requests": [ { "id": "kafka_ordering",
+    "request": { "query": { "multi_match": { "query": "kafka ordering", "fields": ["title^3","body"] } } },
+    "ratings": [ { "_index": "documents_v2", "_id": "d1", "rating": 3 },
+                 { "_index": "documents_v2", "_id": "d2", "rating": 2 },
+                 { "_index": "documents_v2", "_id": "d9", "rating": 0 } ] } ],
+  "metric": { "dcg": { "k": 10, "normalize": true } } }'
 ```
 
 ```json
 {"metric_score":1.0,"details":{"kafka_ordering":{"metric_score":1.0,
-  "unrated_docs":[{"_id":"d4"},{"_id":"d5"}],
-  "metric_details":{"dcg":{"dcg":8.892789,"ideal_dcg":8.892789,
-                           "normalized_dcg":1.0,"unrated_docs":2}}}}}
+  "unrated_docs":[{"_id":"d4"},{"_id":"d5"}], ...}}}
 ```
 
-One number: 1.0, because for this query the ranking is already the ideal one — d1 (rating 3) above d2 (rating 2) above d9 (rating 0). Note `unrated_docs`, which is the honest part of the report: two returned documents were never judged, so the metric is only as good as your judgment list is complete.
-
-Now change the boost from `title^3` to `title^10`, run it again, and you find out whether you helped — across two hundred queries rather than the one you happened to be looking at. Wire it into continuous integration so that a relevance regression **fails a build** rather than surfacing three weeks later in a support ticket. This is the single most valuable piece of infrastructure in a search project and routinely the last thing teams build.
+1.0: the ranking is already ideal. `unrated_docs` is the honest part: the metric is only as good as your list. Change `title^3` to `title^10`, rerun across two hundred queries, and you *know*. Wire it into CI so a relevance regression **fails a build**: the most valuable infrastructure in a search project, and routinely the last built.
 
 ---
 
-## §2.10 Living with an index
-
-Three operational patterns carry most of the day-to-day work.
+## 2.10 Living with an index
 
 ### Bulk indexing
 
-One HTTP request per document is slow, for all the reasons §1.9 gave. The `_bulk` API batches them:
-
-```
-POST /_bulk
-{ "index":  { "_index": "documents", "_id": "d-1001" } }
-{ "title": "Kafka partitions", "body": "..." }
-{ "update": { "_index": "documents", "_id": "d-1002" } }
-{ "doc": { "status": "published" } }
-{ "delete": { "_index": "documents", "_id": "d-1003" } }
-```
-
-Newline-delimited JSON: one action line, one source line, repeated — with a trailing newline the API genuinely requires. (The odd format exists so the server can split the payload without parsing all of it first.)
-
-Rules for using it well:
-
-- **Size by bytes, not by document count** — aim for five to fifteen megabytes per request. A thousand tiny documents and a thousand huge ones are completely different requests; only the byte size predicts behaviour.
-- **A few concurrent bulk threads** rather than one giant serial stream. Two to four per data node is a reasonable starting point.
-- **Retry `429 Too Many Requests` with backoff.** That response is not an error — it is OpenSearch's write queue applying backpressure exactly as §1.6 recommends. The correct response is to slow down, not to page someone.
-
-Then the rule I want to state as strongly as I can, because ignoring it is the most common data-loss bug in indexing pipelines:
+One request per document is slow (§1.9). The `_bulk` API you used in §2.0 batches `index`, `update` and `delete` actions as newline-delimited JSON (an action line, then a source line, and a required trailing newline). Size requests by bytes (five to fifteen megabytes), run two to four threads per data node, and retry `429 Too Many Requests` with backoff: it is backpressure (§1.6), not an error.
 
 > **A `200 OK` on a bulk request does not mean the documents were indexed.**
 
-The bulk API returns 200 as long as the *request* was processed. Individual items inside it can fail — a mapping conflict, a version conflict, a rejected write — each with its own status. Prove it to yourself: send one good document and one with a date where a date cannot go.
+Items fail independently. Send one good document and one with a bad date:
 
 ```bash
 curl -s -X POST 'localhost:9200/_bulk?refresh=wait_for' -H 'Content-Type: application/x-ndjson' --data-binary '
@@ -1536,52 +855,20 @@ curl -s -X POST 'localhost:9200/_bulk?refresh=wait_for' -H 'Content-Type: applic
 '
 ```
 
-```
-HTTP/1.1 200 OK
-```
 ```json
-{ "took": 8,
-  "errors": true,                          ← the flag you must check
+HTTP/1.1 200 OK
+{ "errors": true,                          ← the flag you must check
   "items": [
     { "index": { "_id": "ok",  "status": 201 } },
     { "index": { "_id": "bad", "status": 400,
-                 "error": { "type": "mapper_parsing_exception",
-                            "reason": "failed to parse field [updated_at] of type [date] in
-                                       document with id 'bad'. Preview of field's value:
-                                       'last tuesday'" } } }
-  ] }
+                 "error": { "type": "mapper_parsing_exception", ... } } } ] }
 ```
 
-Two hundred OK, and one of your documents is gone. **You must check `errors` and the per-item results.** A pipeline that checks only the HTTP status will lose documents silently and indefinitely, while looking completely healthy on every dashboard you own.
-
-Finally, connecting to §1.7: **use a deterministic `_id`** — the document's own identifier from the source system.
-
-```
-with _id = "d-1001":   a retry after a timeout → overwrites. Same document. Fine.
-with a generated _id:  a retry after a timeout → a second copy. Forever.
-```
-
-Deterministic IDs make your entire indexing pipeline **idempotent for free**. Random IDs accumulate duplicates that are very hard to find and remove later.
+Two hundred OK, and a document is gone. **Check `errors` and the per-item results**, or the pipeline loses documents silently while every dashboard looks healthy. And, per §1.7, **use a deterministic `_id`** from the source system: a retry then overwrites instead of creating a second copy, so the pipeline is **idempotent for free**.
 
 ### Aliases, and one rule
 
-An **alias** is a name that points at one or more indexes. It is a small feature, and it is load-bearing for everything else in this section.
-
-You have two indexes in the lab right now: the original `documents` and the better-analysed `documents_v2`. Point an alias at the new one:
-
-```bash
-curl -s -X POST localhost:9200/_aliases -H 'Content-Type: application/json' -d '
-{ "actions": [ { "add": { "index": "documents_v2", "alias": "search" } } ] }'
-
-curl -s 'localhost:9200/search/_search?filter_path=hits.total' -H 'Content-Type: application/json' -d '
-{ "query": { "match": { "title": "ordering" } } }'
-```
-
-```json
-{"hits":{"total":{"value":2,"relation":"eq"}}}
-```
-
-The client asked `search`; the request was served by `documents_v2`. Now do the swap that matters, in one request:
+An **alias** is a name that points at one or more indexes. Swapping one is a single request:
 
 ```json
 POST /_aliases
@@ -1591,254 +878,109 @@ POST /_aliases
 ]}
 ```
 
-Both actions applied **atomically**. There is no instant at which the alias points at both or at neither. Every in-flight query resolves to one index or the other, and the switch is invisible to users.
+Both actions apply **atomically**: there is no instant when the alias points at both or neither.
 
 > **Your application should never reference a concrete index name. Only ever an alias.**
 
-Follow that and every schema change, every reindex, every model upgrade becomes a zero-downtime alias swap with an instant rollback. Ignore it and each of them becomes a coordinated deployment with a maintenance window. The cost of compliance is typing `documents` instead of `documents_v1` on day one.
-
-Aliases do more: a **filtered alias** carries a built-in filter, so you can expose a per-team view of a shared index; a **routing alias** pins queries to a shard; and `is_write_index` designates which index of a group receives writes, which is what makes automatic rollover work.
+Then every schema change is a zero-downtime swap with instant rollback, for the cost of typing `documents` instead of `documents_v1` on day one. Aliases can also carry a filter (a per-team view), pin routing, or mark an `is_write_index`, which makes rollover work.
 
 ### Reindexing
 
-Sooner or later you must change something immutable — a field's type, an analyser, the primary shard count. All of these mean building a new index and copying the data. You already did one in §2.5; here is the production form:
-
-```json
-POST /_reindex?wait_for_completion=false&slices=auto
-{
-  "source": { "index": "documents_v1" },
-  "dest":   { "index": "documents_v2" }
-}
-```
-
-`slices=auto` parallelises the copy by shard, which is a large speedup. `wait_for_completion=false` returns a task ID immediately so that a six-hour reindex does not sit on an HTTP connection; you poll `GET _tasks/<id>`. A `script` can transform documents in flight, and a remote `source` can pull from an entirely different cluster.
-
-The zero-downtime pattern, worth learning as one unit:
+Changing anything immutable (a field type, an analyser, the primary count) means a new index and a copy, the `_reindex` you ran in §2.5. In production add `?slices=auto` (parallel by shard) and `wait_for_completion=false` (returns a task ID to poll with `GET _tasks/<id>`); a `script` can transform documents in flight. The zero-downtime pattern:
 
 1. Create `documents_v2` with the new mapping.
-2. Write new changes to **both** indexes — or, better, make sure your indexing pipeline can be **replayed** from its source, which Chapter 5 will make easy.
-3. Reindex the historical data from v1 to v2.
-4. **Verify**: compare document counts, spot-check a sample, and run your `_rank_eval` judgment set against *both* to confirm relevance did not regress.
-5. Swap the alias atomically.
-6. Keep v1 for a rollback window, then delete it.
+2. Write new changes to **both**, or better, make the pipeline **replayable** from its source (Chapter 5).
+3. Reindex history from v1 to v2.
+4. **Verify**: counts, spot checks, and your `_rank_eval` set against both.
+5. Swap the alias atomically, and keep v1 for a rollback window.
 
-**Step 4 is the one people skip and the one that matters.** An alias swap makes rollback trivial — but only if you notice there is a problem.
+**Step 4 is the one people skip**, and rollback is trivial only if you notice the problem. Relatives: **`_update_by_query`** rewrites documents in place (a new analyser without a new index), and **`_delete_by_query`** writes tombstones (§2.3).
 
-Two relatives are worth knowing. **`_update_by_query`** reindexes documents in place, which is how you apply a *new analyser* to existing data without a new index (the mapping did not change, only how the text is processed). **`_delete_by_query`** removes matching documents — remembering from §2.3 that this writes tombstones, and the space comes back at merge time, not immediately.
+### Templates, lifecycles and snapshots
 
-### Templates and lifecycles
-
-For time-series data — logs, metrics, events — three features combine into the standard pattern.
-
-- An **index template** automatically applies settings, mappings, and aliases to any new index matching a name pattern, so `logs-2026-09-17` is born correctly configured without anyone doing anything.
-- **Rollover** creates the next index and moves the write alias when the current one gets too large or too old.
-- **ISM**, Index State Management, is the lifecycle engine: after seven days reduce replicas and force-merge; after thirty days move to cheaper warm nodes; after ninety days snapshot and delete.
-
-Together they maintain a rolling window of data at bounded cost with no human in the loop.
-
-**Snapshots** round this out: incremental backups to S3 at the segment level, restorable into the same or a different cluster. And, as §4.6 will insist: **replication is not backup.** Replication faithfully replicates your accidental `_delete_by_query` to every copy, instantly.
+For time-series data, an **index template** configures each new index matching a pattern, **rollover** starts the next index when the current one is too large or old, and **ISM** (Index State Management) runs the lifecycle: force-merge at seven days, warm nodes at thirty, snapshot and delete at ninety. **Snapshots** are incremental backups to S3, and, as §4.6 insists, **replication is not backup**: it copies your accidental `_delete_by_query` everywhere, instantly.
 
 ---
 
-## §2.11 When it goes wrong
+## 2.11 When it goes wrong
 
 ### Reading cluster health
 
-```bash
-curl -s 'localhost:9200/_cluster/health?pretty'
-```
+`GET _cluster/health` returns a status colour:
 
-```json
-{ "cluster_name" : "docker-cluster",
-  "status" : "green",
-  "number_of_nodes" : 1,
-  "number_of_data_nodes" : 1,
-  "active_primary_shards" : 4,
-  "active_shards" : 4,
-  "relocating_shards" : 0,
-  "initializing_shards" : 0,
-  "unassigned_shards" : 0,
-  "active_shards_percent_as_number" : 100.0 }
-```
+| Status | Meaning | Severity |
+|---|---|---|
+| **Green** | every primary and replica assigned | fine |
+| **Yellow** | a replica unassigned: data serving, **redundancy gone** | fix today (harmless on one node, hence the lab's zero replicas) |
+| **Red** | some **primary** unassigned: data unavailable, writes to it fail | outage |
 
-The colours mean something precise.
+Red does not error: searches quietly return **partial results**, so check `_shards.failed`. Then start with `GET _cluster/allocation/explain`, which says in prose why a shard is unassigned. The usual culprit is a **disk watermark**: allocation stops at **85%**, shards stop moving in at **90%**, and indexes go **read-only at 95%** (the **flood stage**), so writes fail while nobody watched disk. Others: a node that left, filtering rules excluding every node, too many shards per node, or a corrupt shard needing `_cluster/reroute?retry_failed`.
 
-**Green** — every primary and every replica is assigned and active. Everything is fine.
+### Sizing, with the reasoning
 
-**Yellow** — every primary is assigned, at least one replica is not. All your data is present and serving normally, but **redundancy is gone**: if the wrong node dies now, you lose data. On a single-node development cluster this is permanent and harmless — a replica cannot sit on its primary's node and there is nowhere else — which is why the lab set `number_of_replicas: 0`. In production it means *fix this today*.
+- **Ten to fifty gigabytes per shard.** Smaller wastes per-shard overhead; larger makes recovery slow, because moving a shard moves all of it.
+- **About twenty shards per gigabyte of heap per node**, and fewer is better.
+- **Heap at most 31 GB**, a real cliff: above roughly 32 GB the JVM loses *compressed ordinary object pointers*, every pointer doubles, and a 32 GB heap holds less than a 31 GB one.
+- **Heap at most half of RAM**, because Lucene's speed comes from the **filesystem cache** holding memory-mapped segments. (Kafka wants the same, §5.3.)
 
-**Red** — at least one **primary** is unassigned. Some of your data is unavailable right now. Searches return **partial results**, possibly without your application noticing, and writes to the affected shard fail. This is an outage.
+The most common mistake is **oversharding**: every shard has fixed overhead and every query pays §1.3's straggler tax on each. Use `primaries = ceil(expected_total_GB / 30)`, rounded to a multiple of your data node count, and **not up "just in case"**. Replicas are the easy half: at least one in production, more for read throughput.
 
-That "possibly without noticing" deserves a beat: a red cluster does not error, it quietly returns fewer results. Check `_shards.failed` in your search responses, which is present in every response you have run in this chapter.
+### Troubleshooting playbook
 
-Diagnostic endpoints:
-
-```
-GET _cluster/allocation/explain      ← why is this shard unassigned? START HERE.
-GET _cat/indices?v&health=red
-GET _cat/shards?v&s=state
-GET _cat/nodes?v&h=name,heap.percent,disk.used_percent,cpu,load_1m
-GET _nodes/stats/thread_pool         ← look for non-zero "rejected"
-GET _tasks?detailed                  ← what is running right now
-```
-
-`allocation/explain` is the one to remember — it answers in prose, and the answer is usually one of:
-
-- a **disk watermark** was crossed. OpenSearch stops allocating at **85%**, stops moving shards in at **90%**, and makes indexes **read-only at 95%** — the **flood stage**, which surprises people badly, because writes start failing and disk usage is not where they were looking;
-- a node left the cluster and has not returned;
-- allocation filtering rules exclude every eligible node;
-- there are too many shards per node;
-- a shard is corrupt and needs `_cluster/reroute?retry_failed`.
-
-### Sizing, with the reasoning (which outlives the numbers)
-
-**Ten to fifty gigabytes per shard.** Below ten you pay per-shard overhead — heap, file handles, a separate query execution — for very little data. Above fifty, recovery and rebalancing get painful, because moving a shard means moving *all of it*, and a 200 GB shard takes a long time to cross a network while the cluster sits degraded.
-
-**Roughly twenty shards per gigabyte of heap, per node.** A node with 30 GB of heap manages about six hundred shards. Fewer is better.
-
-**JVM heap at most 31 GB, and at most half the machine's RAM.** Both halves need explaining:
-
-- The **31 GB ceiling** is a genuine cliff, not a guideline. Above roughly 32 GB the JVM can no longer use *compressed ordinary object pointers*; it switches to full 64-bit references, every pointer doubles in size, and you end up with **less usable heap from more memory**. A 32 GB heap holds less than a 31 GB one.
-- The **half-of-RAM rule** exists because Lucene's speed comes from the **filesystem cache**. Segments are memory-mapped files, and the operating system keeping them in free RAM is what makes search fast. Give all your memory to the JVM and you starve the thing that actually matters. (Kafka wants the same thing for the same reason — §5.3.)
-
-And then the mistake I have seen more than any other: **oversharding.**
-
-It is so tempting. Shards are how you scale, so more shards must be more scalable. But every shard is a complete Lucene index with fixed overhead, and every query fans out to **all** of them, paying §1.3's straggler tax on each. A query against five hundred tiny shards is dramatically slower and more expensive than the same query against ten correctly sized ones.
-
-```
-primaries = ceil(expected_total_GB / 30)
-```
-
-then round to a multiple of your data node count so the shards distribute evenly — and **resist the urge to round up "just in case".**
-
-Replicas are the easy half: at least one in production, always. And since the replica count *can* be changed live, you can add replicas to increase read throughput whenever you need to.
-
-### A troubleshooting playbook
-
-**Searches are slow.**
-Run the query with `"profile": true` and find which clause dominates — this usually ends the investigation immediately. Then, in order:
-
-- Are the yes-or-no conditions in `filter`, where they can be cached?
-- Is something paginating deeply?
-- Are there `wildcard`, `regexp`, or `script` queries that should be precomputed at index time?
-- Are you fanning out to more shards than necessary — could routing make a common query hit just one?
-- **Is the working set larger than the filesystem cache**, so that every query goes to disk? That last one is very often the real answer, and the fix is more RAM or faster storage rather than anything clever.
-
-Turn on the **slow log** (`index.search.slowlog.threshold.query.warn: 5s`) so that the actual offenders identify themselves instead of being guessed at.
-
-**Indexing is slow.**
-Check bulk request size and concurrency, and look for `429` rejections indicating you are already at capacity. Check whether something is forcing refreshes — a stray `?refresh=true` in application code is a classic. Look at merge activity, because merges compete with indexing for I/O. Consider dropping replicas to zero during a large backfill. And look for **dynamic mapping updates firing on every document**, which serialise through the cluster manager and throttle everything.
-
-**Memory problems.**
-A `CircuitBreakingException` means a request wanted more heap than it was allowed. **The circuit breaker is protecting you**; the correct response is to fix the query, not to raise the limit.
-
-Long garbage-collection pauses in the logs matter for the reason §1.9 gave: a node in a two-second GC pause is **indistinguishable from a dead node**. So it is removed from the cluster, its shards reallocate, and then it comes back and everything reallocates again. A cluster can thrash like this for hours. The root cause is usually too many shards, fielddata on a text field, or an unbounded aggregation.
+| Symptom | Check, in order |
+|---|---|
+| **Searches slow** | `"profile": true` first. Then: yes/no clauses not in `filter`; deep pagination; `wildcard`/`regexp`/`script` to precompute; too many shards; **working set bigger than the filesystem cache** (often the real answer: more RAM). Turn on the slow log. |
+| **Indexing slow** | Bulk size and concurrency; `429`s; a stray `?refresh=true`; merges; replicas not zeroed for a backfill; **dynamic mapping updates on every document**. |
+| **`CircuitBreakingException`** | The breaker is protecting you: fix the query, not the limit. |
+| **GC pauses, nodes flapping** | A node in a two-second pause looks dead (§1.9), so shards reallocate away and back, for hours. Usually too many shards, fielddata on a text field, or an unbounded aggregation. |
 
 ---
 
-## §2.12 Where Lantern stands
+## 2.12 Where Lantern stands
 
-We have built something real. Here it is, and every phrase should now decode.
+Lantern's search, where every phrase should now decode:
 
-Lantern has an OpenSearch cluster. Two hundred million documents live in an index called `documents_v1`, behind an alias called `documents`. There are twelve primary shards of roughly twenty-five gigabytes each with one replica apiece, spread over six data nodes, with three small dedicated cluster-manager nodes holding the election quorum.
+- 200 million documents in `documents_v1`, **behind the alias** `documents` (§2.10).
+- **Twelve primaries of ~25 GB**, one replica each, on six data nodes, plus **three dedicated cluster managers** (§2.3, §2.11).
+- A **custom analyser plus a `keyword` multi-field** (§2.4, §2.5); status, team and date only in **`filter`** (§2.8).
+- **`title^3`, a phrase clause, a recency decay**, and two hundred judged queries in CI failing the build if nDCG@10 drops (§2.9).
+- **`_bulk`** in ten-megabyte batches with source IDs and per-item checks (§2.10); edits searchable about a second later (§2.6).
 
-Each document's text is indexed as `text` with a custom analyser — HTML stripped, lowercased, accent-folded, stemmed — and simultaneously as `keyword` through a multi-field, so that the same field can be searched, sorted, and aggregated. Status, team, and timestamp are keyword and date fields used exclusively in `filter` clauses, where they are cached as bitsets. Queries are `multi_match` across title and body with the title boosted threefold, plus a `should` phrase clause for adjacency and a `function_score` recency decay. A judgment set of two hundred queries runs in CI and fails the build if nDCG@10 drops.
-
-Documents are written through the `_bulk` API in ten-megabyte batches, keyed by the source system's document ID so that retries overwrite rather than duplicate, with per-item error checking. A document edited in PostgreSQL becomes searchable about a second later, because of the refresh interval, and everybody involved knows that number and monitors it.
-
-Annotated, so that nothing is decoration:
-
-- *twelve primary shards of ~25 GB* — inside the 10–50 GB window (§2.11), and 12 divides evenly across 6 data nodes.
-- *behind an alias* — the §2.10 rule, so every future migration is an atomic swap.
-- *three dedicated cluster-manager nodes* — a quorum of three tolerating one failure, isolated from search traffic (§2.3).
-- *`text` plus `keyword` multi-field* — so the same field can be searched *and* sorted or aggregated (§2.4, and the error at the end of §2.2).
-- *filters used exclusively in `filter` clauses* — no scoring, cached bitsets (§2.8).
-- *`title^3`, a `should` phrase clause, a recency decay* — improvements 1, 3, and 4 from §2.9.
-- *a judgment set in CI* — the thing teams build last, built first (§2.9).
-- *`_bulk`, deterministic IDs, per-item error checks* — every rule from §2.10.
-- *searchable about a second later* — the refresh interval (§2.6), understood and monitored rather than discovered in a bug report.
-
-It works. Searches return in forty milliseconds at the median and a hundred and eighty at the ninety-ninth percentile. A node can die without anyone noticing.
+It works: forty milliseconds at the median, a hundred and eighty at p99, and a node can die without anyone noticing.
 
 ### And the wall it hits
 
-A user types *"why does my deployment keep restarting"*. The document that answers it is d7, **"Diagnosing CrashLoopBackOff"**.
-
-Run the intersection from §2.2 by hand:
+A user types *"why does my deployment keep restarting"*. The answer is d7, **"Diagnosing CrashLoopBackOff"**. Run the intersection from §2.2:
 
 ```
 query terms:     [why, doe, my, deploy, keep, restart]
 document terms:  [diagnos, crashloopbackoff]
-
 intersection:    ∅
 ```
-
-**Empty.** Not ranked low — *not a candidate at all*. The postings lists do not touch. Confirm it in the lab:
 
 ```bash
 curl -s 'localhost:9200/documents_v2/_search?filter_path=hits.total' -H 'Content-Type: application/json' -d '
 { "query": { "multi_match": { "query": "why does my deployment keep restarting",
                               "fields": ["title^3","body"] } } }'
+# → {"hits":{"total":{"value":0,"relation":"eq"}}}
 ```
 
-```json
-{"hits":{"total":{"value":0,"relation":"eq"}}}
-```
-
-Zero. And no amount of stemming, synonyms, or boosting fixes this, because those operate on words and this is not a word problem. "CrashLoopBackOff" *means* "keeps restarting", and the inverted index has no representation of meaning whatsoever. It is a machine for matching strings that happen to be words.
-
-The same happens for *"kubernetes pod memory limits"* against a document titled *"k8s container resource constraints"*: zero shared terms, so a document that fully answers the question ranks below several that merely say "Kubernetes" a lot.
-
-You could add a synonym: `k8s → kubernetes`. And another: `pod → container`. And `limits → constraints`. And then a thousand more, and you still will not have covered how people phrase things, because the space of phrasings is not enumerable. Every tool in this chapter papers over the gap one word at a time, and one word at a time does not scale.
-
-To close it, you have to stop indexing words and start indexing something else. Which is Chapter 3, and it begins with a very strange idea.
+Not ranked low: *not a candidate*. "CrashLoopBackOff" *means* "keeps restarting", and the inverted index has no representation of meaning. Synonyms (`k8s → kubernetes`, `pod → container`, and a thousand more) patch it one word at a time, and phrasings are not enumerable.
 
 ---
 
-## The one-page summary
+## Key takeaways
 
-**The core mechanism.** An inverted index maps terms to documents. Queries become intersections of sorted lists, which is why search is fast without scanning anything. Doc values are the mirror structure — documents to values — and they are why sorting and aggregating work, and why they do *not* work on `text` fields.
+- An **inverted index** maps terms to sorted document lists; a query is an intersection, so nothing is scanned. **Doc values** map documents to values for sorting and aggregation, so sort on `.keyword`, never `text`.
+- A **shard is a complete search engine**: searches scatter-gather, scores vary per shard, `terms` counts are approximate.
+- Routing is `hash(_id) % primaries`, so **the primary count is fixed at creation**; replicas can change any time.
+- **Refresh** (visibility, 1 s) ≠ **flush** (segment durability) ≠ **translog fsync** (crash safety).
+- Something should match and doesn't? **`_analyze` both sides**, and look for `term` on a `text` field.
+- **Yes-or-no constraints go in `filter`**: no scoring, cached bitsets.
+- **BM25** scores are relative; field boosting is the cheapest win, and nothing counts as better until a judgment set says so.
+- **Query through an alias, use deterministic IDs, check per-item bulk errors.**
+- Shards of 10–50 GB, heap ≤ 31 GB and ≤ half of RAM, and no oversharding.
 
-**The distributed layer.** An index is split into shards, and each shard is a complete, independent Lucene index. Searching means scatter-gather over all of them. That single fact explains score variation between shards, approximate aggregations, and the straggler tax.
+## Where we are
 
-**The write path.** Routing is `hash(id) % primaries`, which is why the primary count is frozen at creation. Refresh (1 s, visibility) ≠ flush (durability of segments) ≠ translog fsync (crash safety of the acknowledgement). Segments are immutable; an update is a new copy plus a tombstone; merges do the real cleanup.
-
-**The query language.** Score-bearing clauses go in `must` and `should`; yes-or-no constraints go in `filter`, where they are cached. Full-text queries analyse their input, term-level queries do not. Analysis must produce compatible terms on both sides, and `_analyze` is how you see it.
-
-**Relevance.** BM25 = saturating term frequency × inverse document frequency × length normalisation. Scores are relative, never absolute. Field boosting is the cheapest win available. And nothing counts as an improvement until a judgment set says it is.
-
-**Operations.** Always query through an alias. Always use deterministic IDs and check per-item bulk errors. Size shards at 10–50 GB and resist oversharding. Heap at most 31 GB and at most half of RAM.
-
-**The limit.** All of it matches words. Users ask about meaning. That gap is Chapter 3.
-
----
-
-## Glossary of terms this chapter assumes
-
-| Term | Meaning |
-|---|---|
-| **term** | one indexed token — the atomic unit of matching |
-| **term dictionary** | the sorted list of all terms in a shard |
-| **postings list** | the sorted list of documents containing a term |
-| **tf** | term frequency — occurrences of a term in one document |
-| **IDF** | inverse document frequency — how rare a term is; rarer scores higher |
-| **analysis** | the pipeline turning a string into terms; runs at index *and* query time |
-| **tokenizer** | the stage that splits text into tokens (exactly one per analyzer) |
-| **token filter** | a stage that transforms the token stream (lowercase, stem, fold…) |
-| **stemming** | reducing words to a root form (`running` → `run`) |
-| **precision** | of what I returned, how much was relevant |
-| **recall** | of everything relevant, how much did I return |
-| **doc values** | the columnar document-to-value structure used for sorting and aggregating |
-| **segment** | an immutable file of indexed data inside a shard |
-| **merge** | background combination of segments; also when deletes are really applied |
-| **refresh** | making recent writes *visible* to search (default 1 s) |
-| **flush** | fsyncing segments to disk |
-| **translog** | the write-ahead log that makes an acknowledged write crash-safe |
-| **shard** | a slice of an index, and a complete Lucene index in its own right |
-| **primary / replica** | the write-accepting copy / an exact copy elsewhere for reads and failover |
-| **routing** | `hash(id) % primaries`, deciding which shard owns a document |
-| **coordinating node** | whichever node received your request and fans it out |
-| **mapping** | the schema: field types and how each is analysed and stored |
-| **multi-field** | one JSON field indexed several ways (e.g. `title` and `title.keyword`) |
-| **alias** | a name pointing at indexes; the thing your application should always query |
-| **nDCG** | the standard position-discounted, graded-relevance ranking metric |
+Everything in this chapter matches words, and users ask about meaning. To close that gap you have to stop indexing words and start indexing something else, which is Chapter 3, and it begins with a very strange idea.

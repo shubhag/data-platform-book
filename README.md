@@ -9,28 +9,28 @@
 | | | Pages |
 |---|---|---|
 | | **[Preface](00-preface.md)** — what this is, how to read it, and a fictional system called Lantern | ~3 |
-| **1** | **[The Machine That Isn't One](01-the-machine-that-isnt-one.md)** | ~25 |
+| **1** | **[The Machine That Isn't One](01-the-machine-that-isnt-one.md)** | ~14 |
 | | *Partitioning · replication · the dead-versus-slow problem · consensus and quorums · retries, duplicates, and idempotency · consistency, CAP and PACELC · latency, throughput, and finding bottlenecks* | |
-| **2** | **[Finding Things](02-finding-things.md)** | ~35 |
+| **2** | **[Finding Things](02-finding-things.md)** | ~20 |
 | | *Built around a runnable ten-document lab — every rule is a request you paste and a response you read. Why a database can't search · the inverted index · shards, segments, and immutability · mappings, `text` vs `keyword` · analyzers and `_analyze` · the write path and near-real-time · query vs filter context · aggregations and approximation · BM25 worked by hand · aliases, bulk indexing, reindexing · sizing and troubleshooting* | |
-| **3** | **[Meaning as Geometry](03-meaning-as-geometry.md)** | ~30 |
+| **3** | **[Meaning as Geometry](03-meaning-as-geometry.md)** | ~13 |
 | | *Embeddings and what 768 dimensions mean · chunking · cosine, dot product, L2 · the curse of dimensionality · HNSW as an express-train network · keyword vs semantic, honestly compared · hybrid search and RRF · bi-encoders vs cross-encoders · filtering without destroying recall · measuring relevance* | |
-| **4** | **[Moving Data](04-moving-data.md)** | ~22 |
+| **4** | **[Moving Data](04-moving-data.md)** | ~12 |
 | | *Platform layers and the raw-data rule · batch vs stream vs micro-batch · Lambda's drift problem · rows vs columns, JSON/Avro/Parquet · table formats and the lakehouse · schema evolution and registries · the four quality dimensions · idempotency, deduplication, and safe reprocessing* | |
-| **5** | **[The Log](05-the-log.md)** | ~24 |
+| **5** | **[The Log](05-the-log.md)** | ~12 |
 | | *Why "message queue" is the wrong model · topics, partitions, and the two rules · keys and ordering · ISR and the durability triad · compaction as a table · producers, batching, and idempotence · consumer groups, offsets, and the auto-commit trap · rebalancing · lag · CDC and the ecosystem* | |
-| **6** | **[Time](06-time.md)** | ~26 |
+| **6** | **[Time](06-time.md)** | ~17 |
 | | *The question with no good answer · Flink's architecture and real backpressure · keyed state and what bounds it · checkpoint barriers and consistent snapshots without stopping · savepoints and operator UIDs · event time and watermarks · the stuck-watermark trap · windows, triggers, and joins · Flink SQL* | |
-| **7** | **[The Unbounded Table](07-the-unbounded-table.md)** | ~23 |
+| **7** | **[The Unbounded Table](07-the-unbounded-table.md)** | ~11 |
 | | *Spark's execution model · laziness, Catalyst, and why RDDs lose · the shuffle · skew and salting · the unbounded-table idea · micro-batches and triggers · `availableNow` as incremental batch · `foreachBatch` · watermarks that bound state · exactly-once and its three conditions · choosing between Spark and Flink* | |
-| **8** | **[The Warehouse and the Lake](08-the-warehouse-and-the-lake.md)** | ~34 |
+| **8** | **[The Warehouse and the Lake](08-the-warehouse-and-the-lake.md)** | ~16 |
 | | *Written for someone who has never touched OLAP. Why an analytical query kills an operational database · OLTP vs OLAP · how a columnar engine really answers a query — partition pruning, file skipping, vectorization · facts, dimensions, grain, and slowly changing dimensions · warehouse vs lake vs lakehouse · Delta Lake's transaction log, `MERGE`, time travel, `OPTIMIZE` and `VACUUM` · what Databricks actually is — clusters, DBUs, Photon, Unity Catalog, Auto Loader, declarative pipelines · the medallion architecture, worked end to end · cost and performance tuning* | |
-| **9** | **[The Whole Machine](09-the-whole-machine.md)** | ~18 |
+| **9** | **[The Whole Machine](09-the-whole-machine.md)** | ~10 |
 | | *The complete architecture · one edit traced end to end with the guarantee at every hop · how idempotency, ordering, failure, and backpressure thread through · **the eight ideas that recur everywhere** · 48 self-test questions · a four-week learning plan* | |
 | **A** | **[Glossary](10-appendix-a-glossary.md)** — every term, grouped by chapter, with section references | ~16 |
 | **B** | **[Reference Tables](11-appendix-b-reference.md)** — sizing rules, diagnostic first moves, commands, checklists | ~13 |
 
-**Total: roughly 254 pages, 4–5 hours of reading.**
+**Total: roughly 155 pages, about 3 hours of reading.** Each chapter opens with what it will teach you and closes with key takeaways.
 
 ---
 

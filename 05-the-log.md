@@ -1,16 +1,20 @@
 # Chapter 5 — The Log
 
+Lantern's documents change hundreds of times a second, and several systems need each change: the search indexer, analytics, an audit archive. Wiring each one to the database, or having the application write to all of them, breaks the first time anything fails. This chapter is about Kafka, the durable log that sits in the middle and lets every consumer read the same changes at its own pace.
+
+**By the end you'll be able to:**
+
+- Explain why Kafka is a log rather than a queue, and what that buys you.
+- Choose a partition key and a partition count for a new topic.
+- Configure producers and topics so a single broker failure loses no data.
+- Commit consumer offsets correctly and read consumer lag.
+- State what "exactly-once" really covers, and build the at-least-once plus idempotent-sink pattern that most pipelines actually use.
+
 ## 5.1 The wrong mental model
 
-Kafka is usually introduced as a message queue, and that introduction does more harm than good. So let us start by noticing what is wrong with it.
+Kafka is usually introduced as a message queue, and that does more harm than good. In a **queue** (RabbitMQ, SQS, any job queue), a consumer takes a message out and **the message is now gone**. Reading is destructive, and each message has one consumer; if two systems need it, you need two queues and a fan-out.
 
-A queue is a place where messages wait to be collected. A producer puts a message in; a consumer takes it out; **the message is now gone**. This is a perfectly good abstraction — it is what RabbitMQ and SQS and every job queue you have used provide — and it has two properties baked into it. First, reading is destructive: once consumed, the message no longer exists. Second, a message has one consumer; if two systems both need it, you need two queues and a fan-out mechanism.
-
-Kafka is not that. Kafka is **a file that many people read**.
-
-Specifically, it is an append-only log — the write-ahead log of §1.6, promoted from an implementation detail to the entire product. Writers append to the end. Readers read from wherever they like, at their own pace, without affecting each other or the data. Nothing is removed on read. Records are deleted on a schedule, or never.
-
-That shift sounds academic and changes everything downstream, so let me draw it:
+Kafka is not that. Kafka is **a file that many people read**. Specifically, it is an append-only log — the write-ahead log of §1.6, promoted from an implementation detail to the entire product. Writers append to the end; readers read from wherever they like. Nothing is removed on read; records are deleted on a schedule, or never.
 
 ```
 Topic "document-changes", partition 0:
@@ -24,72 +28,65 @@ offset:   0     1     2     3     4     5     6     7   ← next append here
             (at offset 2)             (at offset 5)
 ```
 
-Two independent consumers, at different positions, reading the same records. Neither knows the other exists. Neither can affect the other. And the records at offsets 0 and 1, which both have passed, are **still there** — because deletion is governed by a retention policy, not by consumption.
+Two consumers at different positions read the same records, unaware of each other. Offsets 0 and 1 are **still there**: deletion follows retention, not consumption.
 
-Three properties do all the work in this chapter, and everything else follows from them.
+Three properties do all the work in this chapter:
 
-**One: appends are immutable and sequential.** Nothing is ever modified in place. This is the same immutability that made Lucene segments fast in §2.3, for the same reasons — no locking, aggressive caching, and purely sequential disk writes. It is worth appreciating how fast sequential writes are: on spinning disks, sequential throughput is hundreds of times better than random, and even on SSDs the difference is large. Kafka handles millions of messages per second on ordinary hardware not because of clever tricks but because appending to a file is the fastest thing a storage device does.
+1. **Appends are immutable and sequential.** Nothing is modified in place — the same immutability that made Lucene segments fast in §2.3, for the same reasons: no locking, aggressive caching, purely sequential disk writes. Kafka handles millions of messages per second on ordinary hardware because appending to a file is the fastest thing a storage device does.
+2. **Reading does not consume.** One stream of Lantern's document changes can feed the indexer, analytics, an audit archive, and a cache invalidator, at no extra cost to the producer.
+3. **Consumers control their own position.** Rewind to reprocess after a bug or rebuild an index; skip forward to abandon a backlog. This makes Kafka a *replayable* source, which is what makes Kappa architecture (§4.3) and routine backfills (§4.7) practical.
 
-**Two: reading does not consume.** Many consumers read the same data independently. For Lantern this means one stream of document changes can feed the search indexer, an analytics pipeline, an audit archive, and a cache invalidator, with no coordination between them and no extra cost to the producer. Adding a fifth consumer is free and requires no change to anything that already exists.
-
-**Three: consumers control their own position.** You can rewind. Rewind an hour to reprocess after a bug. Rewind to the beginning to rebuild an index from scratch. Skip forward to abandon a backlog you have decided doesn't matter. This is what makes Kafka a *replayable* source, and it is the mechanism that makes Kappa architecture (§4.3) and routine backfills (§4.7) possible rather than aspirational.
-
-So Kafka is simultaneously several things: a message bus, a buffer that decouples a fast producer from a slow consumer, a durable store of recent history, and the integration backbone that lets systems exchange data without knowing about each other. All of that from a log.
+So Kafka is at once a message bus, a buffer, a store of recent history, and an integration backbone. All from a log.
 
 ## 5.2 Topics, partitions, and the two rules
 
-A **topic** is a named stream of records — `document-changes`, `search-queries`. It is purely a logical name.
+A **topic** is a named stream of records, such as `document-changes`. It is purely a logical name. A **partition** is a physical append-only log on a broker, and a topic is made of one or more of them. This is the partitioning of §1.3, again.
 
-A **partition** is a physical append-only log on a broker, and a topic is made of one or more of them. Partitioning is exactly the mechanism of §1.3, appearing here for the third time in this book.
-
-And now the two rules that govern all Kafka design. I would like you to be able to recite them.
+Two rules govern all Kafka design. Learn them by heart:
 
 > **Rule one: ordering is guaranteed within a partition, and nowhere else.**
 >
 > **Rule two: parallelism is bounded by partition count — a partition is read by at most one consumer in a group.**
 
-Everything you do with Kafka is a consequence of those two sentences in tension: rule one wants records together, rule two wants them spread apart.
+Rule one wants related records together; rule two wants records spread apart. Most Kafka design is managing that tension.
 
 ### The key decides everything
 
-When you produce a record you may attach a **key**, and the key decides the partition:
+When you produce a record you may attach a **key**, and the key picks the partition:
 
 ```
 if key is null:   spread across partitions (sticky, then round-robin)
 else:             partition = murmur2(key) % number_of_partitions
 ```
 
-So **every record with the same key lands in the same partition**, and by rule one, those records are strictly ordered relative to each other.
+So **every record with the same key lands in the same partition**, and by rule one those records stay in order. Here are Lantern's options:
 
-This is the central design lever. Consider Lantern's options.
+| Key | Ordering | Distribution | Verdict |
+|---|---|---|---|
+| `document_id` | per document | even across hundreds of millions of IDs | **right** |
+| `team` | per team | ~200 keys; the platform team sends a third of traffic to one partition | skewed |
+| none | none | perfectly even | fine for logs and metrics only |
 
-**Key by `document_id`.** Every change to a given document goes to one partition, in order. Two edits to the same document are never processed out of sequence. Meanwhile, edits to *different* documents are spread across all partitions and processed fully in parallel. With a few hundred million document IDs, the distribution is beautifully even. This is the right answer, and it is right for a reason worth naming: we identified the ordering requirement (per document) and chose the key to match it exactly — no tighter, which would cost parallelism, and no looser, which would lose correctness.
+`document_id` matches the real ordering requirement exactly: edits to one document stay in order, different documents run in parallel. Keying by `team` is skew (§1.3): one partition's consumer falls behind while eleven idle, and **you cannot add capacity to fix it**, because rule two allows one consumer per partition. Re-keying means reprocessing.
 
-**Key by `team`.** Now there are perhaps two hundred distinct keys for twelve partitions, and the platform team — which owns a third of all documents — sends a third of all traffic to a single partition. That is skew (§1.3), and its consequences here are specific and unpleasant: one partition's consumer falls behind while eleven idle, and because that partition is a single serial log, **you cannot add capacity to fix it.** More consumers will not help; rule two says only one consumer may read that partition. Re-keying means reprocessing.
-
-**No key at all.** Maximum throughput, perfectly even distribution, zero ordering. Correct for logs and metrics where each record stands alone. Wrong for anything where two records about the same thing could conflict.
-
-The general principle: **key by whatever entity needs ordered processing, and nothing coarser.**
+The principle: **key by whatever entity needs ordered processing, and nothing coarser.**
 
 ### Choosing the partition count
 
-Two considerations pull in opposite directions.
+Two forces pull in opposite directions:
 
-Upward: **you cannot have more active consumers in a group than partitions.** Partition count is your ceiling on consumer parallelism, permanently. Twelve partitions means at most twelve consumers doing work, no matter how many you deploy. If you need to process ten thousand records a second and one consumer manages a thousand, you need at least ten partitions and preferably more for headroom.
+- **Up:** you cannot have more active consumers in a group than partitions. Twelve partitions means at most twelve consumers doing work.
+- **Down:** each partition costs files, open handles, buffer memory, and replication traffic, and lengthens leader elections and rebalances. Tens of thousands of partitions hurt in ways that are hard to diagnose.
 
-Downward: partitions are not free. Each is a set of files with open handles, memory for buffers, and replication traffic. Every partition lengthens leader elections and consumer rebalances. Clusters with tens of thousands of partitions start to suffer in ways that are hard to diagnose.
-
-And the asymmetry that makes this decision matter: **increasing the partition count later breaks your key-to-partition mapping.** `murmur2(key) % 12` and `murmur2(key) % 16` disagree for most keys, so after the change a document's history is split across two partitions, and the ordering guarantee you were relying on is broken across the boundary. The old records do not move — Kafka will not rewrite history — so the discontinuity is permanent.
-
-The practical advice is therefore to **over-provision modestly at creation**: two to three times your current need. Not tenfold, which imports the costs above, but enough that you are not forced into a breaking change within the year.
+The catch: **increasing the partition count later breaks your key-to-partition mapping.** `murmur2(key) % 12` and `murmur2(key) % 16` disagree for most keys, so a document's history splits across two partitions, and old records never move. **Over-provision modestly at creation**: two to three times current need, not tenfold.
 
 ### What a record contains
 
-A record is a key, a value, a timestamp, and **headers** — a small map of metadata. Use the headers for cross-cutting concerns: a trace ID for distributed tracing, a schema ID, a source system identifier, the name of the service that produced it. This keeps operational metadata out of your business payload, where it would otherwise end up in your schema and then in your analytics tables forever.
+A record is a key, a value, a timestamp, and **headers**, a small map of metadata. Put cross-cutting metadata there (trace ID, schema ID, producing service) so it stays out of your payload, and out of your analytics tables forever.
 
 ## 5.3 Brokers, replication, and the three settings that matter
 
-A **broker** is one Kafka server; a **cluster** is a set of them. Partitions are distributed across brokers, and each partition is replicated.
+A **broker** is one Kafka server; a **cluster** is a set of them. Partitions are spread across brokers, and each partition is replicated.
 
 ```
 Topic with 3 partitions, replication factor 3
@@ -100,15 +97,13 @@ Topic with 3 partitions, replication factor 3
  P2 follower       P2 follower       P2 leader
 ```
 
-Each partition has one **leader**, which handles all reads and writes for it. **Followers** continuously fetch from the leader and append the same records in the same order. This is leader–follower replication (§1.4) again, and note that leadership is spread deliberately across brokers so that no single machine handles all the write traffic.
+Each partition has one **leader**, which handles all reads and writes; **followers** fetch from it and append the same records in order. This is leader–follower replication (§1.4), with leadership spread across brokers.
 
-The set of followers that are sufficiently caught up is called the **ISR** — the **in-sync replicas**. It is a dynamic set: a follower that falls too far behind is *removed* from the ISR, and rejoins when it catches up. When a leader fails, the controller elects a new leader **from the ISR**, which is the guarantee that matters: an ISR member has all the acknowledged records, so nothing committed is lost.
+The followers that are sufficiently caught up form the **ISR** (**in-sync replicas**). Laggards drop out and rejoin once caught up. When a leader fails, the controller elects a new leader **from the ISR**. Every ISR member has all the acknowledged records, so nothing committed is lost.
 
 ### The durability triad
 
-Chapter 1 (§1.4) described the choice between synchronous and asynchronous replication in the abstract and promised you would meet it as a configuration flag. Here it is.
-
-**The producer's `acks` setting** determines what the leader waits for before acknowledging:
+Here is §1.4's sync-versus-async replication choice as configuration. **The producer's `acks` setting** controls what the leader waits for before acknowledging:
 
 | Setting | Leader waits for | Result |
 |---|---|---|
@@ -116,9 +111,9 @@ Chapter 1 (§1.4) described the choice between synchronous and asynchronous repl
 | `acks=1` | its own log write | fast; **loses data if the leader dies before followers catch up** |
 | `acks=all` | all in-sync replicas | slower; no loss while at least one ISR member survives |
 
-**The topic's `min.insync.replicas`** sets a floor. With `acks=all`, if fewer than this many replicas are in sync, the write is **rejected** rather than accepted with weaker guarantees. This is the crucial complement to `acks=all`, and here is why: on its own, `acks=all` means "all *in-sync* replicas", and if two of your three replicas have fallen out of the ISR, then "all in-sync replicas" means one — the leader. Your `acks=all` has silently degraded to `acks=1` at the exact moment you most needed it. `min.insync.replicas` closes that hole by refusing the write instead.
+**The topic's `min.insync.replicas`** sets a floor: with `acks=all`, if fewer than this many replicas are in sync, the write is **rejected**. You need it because `acks=all` means "all *in-sync* replicas". If two of three replicas have dropped out of the ISR, that means just the leader, and your `acks=all` has quietly become `acks=1` exactly when you needed it most.
 
-So the canonical safe configuration, which you should treat as the default and deviate from only deliberately:
+The canonical safe configuration, to deviate from only deliberately:
 
 ```
 replication.factor    = 3
@@ -126,47 +121,37 @@ min.insync.replicas   = 2
 acks                  = all
 ```
 
-Read it as a sentence: three copies exist, at least two must confirm each write, and the producer waits for that confirmation. **You survive the loss of any one broker with zero data loss and zero interruption to writes** — because you only ever needed two of the three, so the third's death changes nothing. Lose a second broker and writes stop, which is the system correctly refusing to accept data it cannot protect.
-
-Compare the alternatives to see why this one is chosen. `min.insync.replicas=3` with RF=3 blocks writes the instant any broker restarts, which is too strict for a system that has deployments. `min.insync.replicas=1` gives you no real guarantee, as we just saw. Two out of three is the point where durability and availability are both satisfied.
+Three copies, two must confirm each write, and the producer waits. **You survive the loss of any one broker with zero data loss and no interruption to writes.** Lose a second and writes stop, which is the system correctly refusing data it cannot protect. (`min.insync.replicas=3` blocks writes whenever any broker restarts; `1` guarantees nothing.)
 
 ### The setting that will lose your data
 
-One more, and it deserves its own space because the default has changed over time and because its name does not convey its consequences.
+**`unclean.leader.election.enable`** decides what happens when every ISR member for a partition is down and only an out-of-sync replica remains, one missing the last few thousand records.
 
-**`unclean.leader.election.enable`.** Suppose every ISR member for a partition is down, and only an out-of-sync replica remains — one that is missing the last few thousand records. Two choices: leave the partition offline until an ISR member returns, or promote the stale replica and continue.
+| Value | Behaviour | CAP choice (§1.4) |
+|---|---|---|
+| `true` | promote the stale replica; partition comes back, **those acknowledged records are gone forever**, and consumers see offsets rewind | availability |
+| `false` | partition stays offline until a replica with the data returns | consistency |
 
-If this setting is `true`, Kafka promotes the stale replica. The partition comes back. And **those few thousand acknowledged records are gone forever**, silently, with the log now continuing from an earlier point. Consumers that had read past that point see the offsets rewind, which breaks things in creative ways.
-
-If it is `false`, the partition stays offline until a replica with the data returns.
-
-This is the CAP choice of §1.4 reduced to a single boolean. `true` is availability; `false` is consistency. Keep it `false` unless you have explicitly decided that for this particular topic, being up matters more than being correct — which is a legitimate decision for some data and should be made consciously.
+Keep it `false` unless you have consciously decided that, for this topic, being up matters more than being correct.
 
 ### How the data is stored
 
-A partition is a directory. Inside it are **segment** files — by default one gigabyte or seven days each — plus index files mapping offsets and timestamps to positions in those segments.
-
-Retention deletes whole segments, never individual records, which is why retention is coarse: `retention.ms` (a week by default) or `retention.bytes`.
+A partition is a directory of **segment** files (by default one gigabyte or seven days each), plus index files mapping offsets and timestamps to positions. Retention deletes whole segments, never individual records, so it is coarse: `retention.ms` (a week by default) or `retention.bytes`.
 
 ### Compaction: turning a log into a table
 
-There is a second retention policy, and it is conceptually the most interesting feature in Kafka.
+Set `cleanup.policy=compact` and Kafka stops deleting by age. Instead, **compaction** keeps **the most recent record for each key** and discards older ones. A record with a `null` value is a **tombstone**, meaning "this key is deleted", and is itself removed after a grace period.
 
-Set `cleanup.policy=compact` and Kafka stops deleting by age. Instead, a background process keeps **the most recent record for each key** and discards the older ones. A record with a `null` value is a **tombstone**, meaning "this key is deleted", and is itself removed after a grace period.
-
-Think about what that gives you. The topic is no longer a history of changes that expires; it is a **complete, durable, replayable snapshot of current state**, keyed by ID, that you can read from the beginning to reconstruct everything. It is a table, stored as a log, with the log's replay properties intact.
-
-This is not a niche feature. Kafka stores consumer offsets in a compacted topic. Kafka Streams and Flink back their state stores with compacted changelog topics, which is how their state survives a total cluster loss. And for Lantern it is exactly the right shape for the document-change stream: if the topic is compacted on `document_id`, then reading it from the beginning gives you the current version of every document — precisely what you need to rebuild the search index from scratch, which is precisely what a model change in Chapter 3 requires.
+The topic is now a **replayable snapshot of current state**: a table stored as a log. Kafka keeps consumer offsets this way, and Kafka Streams and Flink back their state stores with compacted changelog topics so state survives losing the cluster. For Lantern, a `document-changes` topic compacted on `document_id` gives you the current version of every document when read from the start — exactly what rebuilding the index after a Chapter 3 model change requires.
 
 ### Two mechanisms worth knowing by name
 
-**Zero-copy.** When a consumer fetches records, Kafka uses the `sendfile` system call to transfer bytes directly from the filesystem cache to the network socket, without copying them into the application's memory and back. This is a large part of its throughput, and it has a consequence you might not predict: consumers that are reading *recent* data are served entirely from the operating system's page cache and never touch the disk at all. Which is why Kafka wants most of the machine's RAM left free for the OS rather than given to its JVM heap — the same reasoning as OpenSearch's filesystem cache in §2.11.
-
-**Tiered storage.** Modern Kafka can offload older segments to object storage, keeping only recent data on broker disks. This makes very long retention affordable, which in turn makes Kappa architecture practical — you can genuinely keep a year of history and replay it.
+- **Zero-copy.** Kafka uses the `sendfile` system call to move bytes from the filesystem cache straight to the network socket, never copying them through application memory. Consumers reading *recent* data are served from the OS page cache without touching disk. That is why Kafka wants most RAM left to the OS rather than its JVM heap — the same reasoning as OpenSearch in §2.11.
+- **Tiered storage.** Modern Kafka can offload older segments to object storage, keeping only recent data on broker disks. Long retention becomes affordable, so Kappa architecture becomes practical: keep a year of history and replay it.
 
 ### A note on ZooKeeper
 
-Older Kafka kept cluster metadata in Apache ZooKeeper, a separate system that had to be deployed and operated alongside. Modern Kafka uses **KRaft**, in which a quorum of controller nodes runs Raft (§1.6) internally. Fewer moving parts, much faster failover, and far better metadata scalability. If you encounter documentation discussing ZooKeeper ensembles, it is describing the legacy mode.
+Older Kafka kept metadata in a separate ZooKeeper cluster. Modern Kafka uses **KRaft**, where controller nodes run Raft (§1.6) internally: fewer moving parts, faster failover, better metadata scalability. Docs about ZooKeeper ensembles describe the legacy mode.
 
 ## 5.4 Producing
 
@@ -183,37 +168,31 @@ producer.send(new ProducerRecord<>("document-changes", documentId, payload),
 
 ### The send is not a send
 
-The most common misunderstanding: `send()` does not send anything. It places the record in an in-memory accumulator, organised into per-partition batches, and returns immediately. A background I/O thread takes full or expired batches and ships them to brokers. The callback fires when the broker acknowledges.
+`send()` does not send anything. It adds the record to an in-memory batch per partition and returns; a background thread ships batches, and the callback fires on acknowledgement.
 
-Which leads to a performance trap worth naming explicitly. `send()` returns a `Future`, and it is tempting to call `.get()` on it to make sure the record landed. Doing so per record makes every send a blocking round trip and **collapses throughput by roughly two orders of magnitude**, because you have eliminated all batching and all pipelining. Use the callback. Block only when you genuinely need synchronous semantics for a specific record.
+The trap: `send()` returns a `Future`, and calling `.get()` on it per record makes every send a blocking round trip. That **cuts throughput by roughly two orders of magnitude**, because it kills all batching and pipelining. Use the callback.
 
 ### The batching knob, again
 
-**`linger.ms`** is how long the producer waits to accumulate more records before sending a batch. At `0`, records go out as soon as the I/O thread can take them: lowest latency, smallest batches. At `20`, you accept up to twenty extra milliseconds of latency and get substantially larger batches.
+**`linger.ms`** is how long the producer waits to fill a batch: `0` means lowest latency and smallest batches; `20` trades up to twenty milliseconds for much larger ones.
 
-This is §1.9's batching trade-off, and I want to point out that the gain is not merely "fewer requests". Compression in Kafka is applied **per batch**, so a batch of two hundred similar records compresses dramatically better than two hundred individually compressed records — often three to five times better. Larger batches thus reduce network traffic, disk usage, and replication bandwidth simultaneously. A small `linger.ms` is frequently the cheapest improvement available to a Kafka producer, and `zstd` or `lz4` compression is nearly always worth the CPU.
+This is §1.9's batching trade-off, with a bonus: compression is applied **per batch**. A batch of two hundred similar records often compresses three to five times better than two hundred records compressed one by one, which cuts network, disk, and replication traffic together. A small `linger.ms` is often the cheapest producer win available, and `zstd` or `lz4` compression is nearly always worth the CPU.
 
 ### When the buffer fills
 
-`buffer.memory` bounds the accumulator. When brokers are slow or unreachable, the buffer fills, and then `send()` **blocks** for up to `max.block.ms` before throwing.
+`buffer.memory` bounds the accumulator. When brokers are slow or unreachable, it fills, and `send()` **blocks** for up to `max.block.ms` before throwing.
 
-This is not a malfunction. **It is backpressure** (§1.6), working correctly: the system is telling you it cannot accept more data right now. The important thing is what your application does with it. If a blocked `send()` propagates a pause back to whatever is generating the data, you have a correctly-behaving pipeline. If it throws an exception that your code catches and logs, you are silently dropping records under load — which is the exact condition in which you can least afford to.
+That is **backpressure** (§1.6) working correctly. If the pause propagates back to the data source, the pipeline is healthy; if you catch and log the exception, you are silently dropping records under load.
 
 ### Exactly-once writes, for free
 
-Set `enable.idempotence=true` — the default in current clients — and something rather elegant happens.
+Set `enable.idempotence=true` (the default in current clients). The producer gets a **producer ID** and attaches an increasing **sequence number** to each record, per partition. The broker remembers the highest sequence it has seen per producer and partition, and when a retry arrives with a sequence it already accepted, **the broker discards it** and reports success. That is §1.7's idempotency-key pattern, built into the protocol.
 
-The producer is assigned a **producer ID** and attaches a monotonically increasing **sequence number** to each record, per partition. The broker remembers the highest sequence number it has seen for each producer and partition. When a retry arrives carrying a sequence number it has already accepted, **the broker discards it** and reports success.
-
-Duplicates from producer retries are eliminated, at the broker, with no application code. This is §1.7's idempotency-key pattern implemented inside the protocol.
-
-It also fixes a subtler problem. Without idempotence, `retries > 0` combined with more than one in-flight request per connection can **reorder** records: batch two succeeds while batch one is being retried, so batch one's records land after batch two's. Your carefully-designed per-key ordering is quietly broken by a transient network error. With idempotence enabled, the broker enforces sequence ordering and rejects out-of-order batches, so ordering survives retries for up to five in-flight requests.
-
-Leave it on. There is no reason not to.
+It also fixes reordering: without it, retries plus multiple in-flight requests can land batch two before a retried batch one. With it, ordering survives retries for up to five in-flight requests. Leave it on.
 
 ### Transactions
 
-Idempotence handles duplicate *writes*. Transactions handle something larger: atomicity across multiple partitions, and — the reason they exist — atomicity between consuming and producing.
+Idempotence handles duplicate *writes*. **Transactions** give atomicity across multiple partitions and, the real reason they exist, between consuming and producing.
 
 ```java
 producer.initTransactions();
@@ -224,17 +203,15 @@ producer.sendOffsetsToTransaction(offsets, groupMetadata);   // ← the importan
 producer.commitTransaction();
 ```
 
-That third-from-last line is the whole point. The consumer's **offset commit is written inside the same transaction as the output records.** Either both happen or neither does. There is no window in which you have produced output but not recorded that you consumed the input, or vice versa — which is exactly the window that produces duplicates and gaps in a consume-transform-produce pipeline.
+The marked line writes the consumer's **offset commit inside the same transaction as the output records**. Either both happen or neither does, closing the window that causes duplicates and gaps. Consumers with `isolation.level=read_committed` never see records from uncommitted or aborted transactions.
 
-Consumers configured with `isolation.level=read_committed` do not see records from uncommitted or aborted transactions.
-
-This is Kafka's exactly-once processing, and it is what Kafka Streams and Flink use under the hood. It costs perhaps ten to twenty percent of throughput plus additional latency at commit boundaries, and it applies to Kafka-to-Kafka pipelines — a point §5.6 returns to, because it is the most commonly misunderstood limitation in the ecosystem.
+This is Kafka's exactly-once processing, used under the hood by Kafka Streams and Flink. It costs perhaps ten to twenty percent of throughput plus latency at commit boundaries, and it only covers Kafka-to-Kafka pipelines — see §5.6.
 
 ## 5.5 Consuming
 
 ### Consumer groups
 
-Consumers that share a `group.id` cooperate. Kafka assigns each partition to **exactly one** consumer in the group.
+Consumers sharing a `group.id` form a **consumer group**, and Kafka assigns each partition to **exactly one** consumer in it.
 
 ```
 Topic with 4 partitions
@@ -244,23 +221,22 @@ Group "indexer", 2 consumers:        Group "analytics", 1 consumer:
    C2 → P2, P3
 ```
 
-Two things to notice. Within a group, the partitions are divided — the group as a whole processes each record once. Across groups, everything is independent — each group receives **all** the records. So Lantern's single `document-changes` topic feeds the indexer group, the analytics group, and the audit archive group, each at its own pace, each with its own position, with no coordination and no cost to the producer.
+Within a group, partitions are divided, so each record is processed once. Across groups, each receives **all** the records at its own pace.
 
-And rule two from §5.2 shows its teeth: with four partitions, a fifth consumer in a group **sits completely idle.** Not slower — idle, doing nothing, because there is no partition left to assign. This is the single most common surprise for people new to Kafka, and it is why partition count is a capacity decision rather than a cosmetic one.
+Rule two from §5.2 bites here: with four partitions, a fifth consumer in a group **sits completely idle**. Partition count is a capacity decision.
 
 ### Offsets, and where you commit them
 
-An **offset** is a group's position in a partition: the offset of the next record it intends to read. Committed offsets are stored in the internal compacted topic `__consumer_offsets` — which is a nice illustration of §5.3's compaction, since what you want is the latest offset per group-partition, not the history.
+An **offset** is a group's position in a partition: the next record it intends to read. Committed offsets live in the internal compacted topic `__consumer_offsets`, since what matters is the latest offset per group and partition (§5.3).
 
-Now the setting that silently determines your delivery guarantee.
+`enable.auto.commit` defaults to **true**. It commits the current position every five seconds **on a timer, from a background thread, whether or not you have finished processing.** Trace the failure:
 
-`enable.auto.commit` defaults to **true**, and commits the current position every five seconds **on a timer, from a background thread, regardless of whether you have finished processing.**
+- At 0 s, `poll()` returns offsets 100–130 and you start processing.
+- At 5 s, the background thread commits offset 130.
+- At 6 s, you have reached offset 115 and the process crashes.
+- On restart, the group resumes from **130**. Offsets 115–130 are never processed, and nothing records that they were skipped.
 
-Trace the failure. At second zero, `poll()` returns records at offsets 100 through 130. You begin processing. At second five, the background thread commits offset 130. At second six, you have processed up to offset 115 and the process crashes. On restart, the group resumes from the committed position — **offset 130** — and offsets 115 to 130 are never processed. They are not delayed. They are gone, and nothing anywhere records that they were skipped.
-
-Auto-commit gives you **at-most-once** semantics with silent data loss, from a default setting, with no warning. For metrics it is fine. For Lantern's indexer it would mean documents randomly missing from search.
-
-The fix is short:
+Auto-commit gives you **at-most-once** delivery with silent loss, from a default. For Lantern's indexer, that means documents randomly missing from search. The fix:
 
 ```java
 props.put("enable.auto.commit", false);
@@ -272,27 +248,30 @@ while (running) {
 }
 ```
 
-Process, then commit. Now a crash before the commit means the records are redelivered, which is at-least-once, which is harmless because `process` is idempotent (§4.7). This is §1.7's ack-placement diagram made concrete, and it is three lines of code.
+Process, then commit. A crash before the commit redelivers the records — at-least-once — which is harmless because `process` is idempotent (§4.7). This is §1.7's ack-placement diagram in three lines of code.
 
 ### Where to start when there is no position
 
-`auto.offset.reset` determines behaviour when a group has no committed offset — a brand-new group, or one whose stored offset has aged out of retention. `latest` (the default) skips everything that already exists and reads only new records. `earliest` reads the topic from the beginning.
+`auto.offset.reset` applies when a group has no committed offset: a new group, or one whose offset has aged out of retention.
 
-Both are reasonable and both are dangerous by accident. A new consumer group deployed with `earliest` against a topic holding a year of data will start reprocessing a year of data, usually at a moment nobody expected. A group deployed with `latest` when you *intended* a full rebuild silently skips all history and you discover the gap weeks later. Set it explicitly and know which you meant.
+| Value | Behaviour | Accidental failure |
+|---|---|---|
+| `latest` (default) | read only new records | you meant a full rebuild and silently skipped all history |
+| `earliest` | read from the beginning | a new group starts reprocessing a year of data nobody expected |
+
+Set it explicitly, and know which one you meant.
 
 ### Rebalancing, and why it hurts
 
-When a consumer joins, leaves, or is presumed dead, the group **rebalances**: partitions are reassigned among the surviving members.
+When a consumer joins, leaves, or is presumed dead, the group **rebalances**: partitions are reassigned among the members. With the classic eager protocol it is stop-the-world: **every** consumer revokes **all** its partitions, sometimes for tens of seconds.
 
-With the classic eager protocol, a rebalance is stop-the-world — **every** consumer in the group revokes **all** its partitions and stops consuming while the new assignment is computed. On a large group with many partitions this can take tens of seconds, during which nothing is processed. And frequent rebalances are one of the top two or three operational complaints about Kafka, so it is worth knowing their causes.
+| Cause | What happens | Fix |
+|---|---|---|
+| **Slow processing** (most common) | a batch takes longer than `max.poll.interval.ms` (5 min default) between `poll()` calls; the group declares you dead, and your later commit fails because you no longer own the partitions | lower `max.poll.records`, or process faster |
+| **Missed heartbeats** | no heartbeat for `session.timeout.ms` (45 s) and you are evicted — §1.5's failure-detection trade-off | tune the timeouts; too short evicts healthy consumers, too long tolerates dead ones |
+| **Deployments** | every instance restarted in a rolling deploy triggers a rebalance | **static membership** via `group.instance.id` |
 
-**Slow processing** is the most common. Kafka considers a consumer alive partly by whether it calls `poll()` within `max.poll.interval.ms`, five minutes by default. If one batch of records takes longer than that to process — because a downstream service got slow, or because `max.poll.records` was large and each record is expensive — the group concludes you are dead and rebalances. Your consumer then finishes its work, tries to commit, and discovers it no longer owns those partitions. The fix is to reduce `max.poll.records` so a batch is comfortably fast, or to make processing faster.
-
-**Missed heartbeats.** A background thread sends heartbeats every `heartbeat.interval.ms`; miss them for `session.timeout.ms` (45 seconds) and you are evicted. This is §1.5's failure detection, with exactly the trade-off described there — too short and you evict healthy consumers, too long and you tolerate dead ones.
-
-**Deployments.** Every rolling restart triggers a rebalance per instance replaced. The mitigation is **static membership** via `group.instance.id`: a consumer with a stable identity that restarts within its session timeout **reclaims its own partitions** without a group-wide rebalance. This turns a rolling deploy from a series of stop-the-world events into a non-event, and it is one of the highest-value settings in the client.
-
-Also use the **cooperative sticky assignor**, the default in recent versions, which revokes only the partitions that actually need to move rather than all of them. And implement a `ConsumerRebalanceListener` so you can commit offsets and flush buffers in `onPartitionsRevoked`, rather than discovering the revocation when your commit fails.
+**Static membership** gives a consumer a stable identity, so if it restarts within its session timeout it **reclaims its own partitions** without a group-wide rebalance. Rolling deploys become non-events. Also use the **cooperative sticky assignor** (the default in recent versions), which revokes only the partitions that must move. And implement a `ConsumerRebalanceListener` to commit and flush in `onPartitionsRevoked`.
 
 ### Lag, the metric that tells you everything
 
@@ -300,21 +279,18 @@ Also use the **cooperative sticky assignor**, the default in recent versions, wh
 lag = log end offset (latest produced)  −  committed offset (consumer position)
 ```
 
-How many records behind the consumer is. If you monitor one thing about a Kafka pipeline, monitor this, because its *shape over time* diagnoses most problems.
+**Lag** is how far behind the consumer is. If you monitor one thing, monitor this; its shape diagnoses most problems.
 
-**Steadily increasing** means consumers cannot keep up. Add consumers, up to the partition count; beyond that, add partitions or make processing faster.
+| Shape | Meaning | Action |
+|---|---|---|
+| steadily increasing | consumers can't keep up | add consumers up to partition count; then add partitions or speed up processing |
+| spiky | intermittent stalls: GC, slow downstream, rebalances | find the stall |
+| one partition growing, others flat | **key skew** (§5.2) | change the key; capacity won't help |
+| flat and high | keeping up, but a backlog was never cleared | clear the backlog |
 
-**Spiky** — rising and falling — means intermittent stalls: GC pauses, a slow downstream dependency, rebalances.
-
-**Uneven across partitions**, with one partition's lag growing while others stay flat, means **key skew** (§5.2). No amount of added capacity helps; the key must change.
-
-**Flat and high** means you are keeping up but permanently behind, usually because a backlog was never cleared.
-
-One refinement: monitor lag in **time** as well as in records. "Forty thousand records behind" means nothing without knowing the rate — it could be two seconds or two hours. Time lag, measured as the difference between now and the timestamp of the next unprocessed record, is directly comparable against your freshness SLA (§4.6), which makes it the more useful alert.
+Also monitor lag in **time**: "forty thousand records behind" could be two seconds or two hours. Time lag (now minus the timestamp of the next unprocessed record) compares directly with your freshness SLA (§4.6), so it makes the better alert.
 
 ## 5.6 What you actually get, end to end
-
-Assembling everything:
 
 | | Producer | Consumer | Result |
 |---|---|---|---|
@@ -322,59 +298,50 @@ Assembling everything:
 | **At-least-once** | `acks=all`, idempotent | commit after processing | **the default choice**; duplicates possible |
 | **Exactly-once** | transactions | `read_committed`, offsets in transaction | correct; ~10–20% slower; Kafka→Kafka |
 
-And now the limitation that matters most, because it is where people's understanding usually goes wrong.
-
 > **Kafka's exactly-once guarantee covers Kafka → process → Kafka. The moment you write to an external system, it does not apply.**
 
-Kafka's transactions work by atomically committing records into Kafka's own log alongside the offset. OpenSearch is not participating in that transaction. Neither is PostgreSQL, nor S3, nor an HTTP API. There is no distributed transaction spanning Kafka and OpenSearch — and, per §1.7, building one with two-phase commit would be slow and would block on coordinator failure.
+Kafka's transactions commit records into Kafka's own log alongside the offset; OpenSearch, PostgreSQL, S3, and HTTP APIs are not part of them. Spanning them would need two-phase commit, which (§1.7) is slow and blocks on coordinator failure.
 
-So for Lantern's indexer, which reads Kafka and writes OpenSearch, exactly-once is not available from Kafka. What is available is the pattern we have now built three times:
-
-**At-least-once delivery from Kafka, plus an idempotent write to OpenSearch, keyed on `{document_id}:{chunk_index}`.**
-
-A crash redelivers records. The redelivered records overwrite the identical documents already in the index. The final state is correct. The cost is zero — no transactions, no coordination, no throughput penalty — and this is what the great majority of production pipelines actually do. When someone tells you their pipeline is exactly-once, this is usually, and quite properly, what they mean.
+So Lantern's indexer, which reads Kafka and writes OpenSearch, uses the pattern this book has now built three times: **at-least-once delivery from Kafka, plus an idempotent write to OpenSearch keyed on `{document_id}:{chunk_index}`.** A crash redelivers records, which overwrite identical documents, so the final state is correct, at no cost. Most production pipelines do this. When someone says their pipeline is exactly-once, this is usually, and quite properly, what they mean.
 
 ## 5.7 The ecosystem
 
-Kafka rarely arrives alone. Five things you should recognise.
+**Kafka Connect** moves data in and out of Kafka using pluggable connectors (JDBC, S3, OpenSearch, MongoDB, and many more), with offset management, scaling, retry, and error handling already solved. **For straightforward ingest or egress, use a connector rather than writing a consumer.** A hand-written Kafka-to-S3 consumer eventually grows offsets, retries, schema handling, and a DLQ: Connect, reimplemented with fewer tests. Do configure `errors.tolerance` and a **dead-letter queue** topic; the defaults are stricter than you want.
 
-**Kafka Connect** is a framework for moving data in and out of Kafka using pluggable connectors — JDBC, S3, OpenSearch, MongoDB, and many more — with offset management, scaling, retry, and error handling already solved. The advice here is unambiguous: **for straightforward ingest or egress, use a connector rather than writing a consumer.** A hand-written consumer that reads Kafka and writes S3 will, over eighteen months, grow offset handling, backpressure, retry logic, schema handling, and a DLQ, at which point you have reimplemented Kafka Connect with fewer tests. Do configure `errors.tolerance` and a **dead-letter queue** topic; the defaults are stricter than you want.
+**Debezium and change data capture.** Three ways to get PostgreSQL changes into Kafka:
 
-**Debezium and change data capture.** This is how Lantern's pipeline actually begins, so it deserves proper attention.
+| Approach | How | Problem |
+|---|---|---|
+| **Dual write** | application writes to both the database and Kafka | not atomic; any failure between the writes leaves the systems permanently inconsistent, with no record of it |
+| **Polling** | `SELECT * FROM documents WHERE updated_at > ?` every few seconds | misses deletes; misses intermediate states (fine for search, wrong for audit); relies on every code path maintaining `updated_at` |
+| **Change data capture** | read the database's **write-ahead log** (PostgreSQL WAL, MySQL binlog) | none of the above |
 
-The naive way to get PostgreSQL changes into Kafka is to have the application write to both — a **dual write**. This is broken, and it is worth seeing why clearly: the two writes are not atomic, so any failure between them leaves the systems permanently inconsistent, with no record of the divergence. The database has the edit and the search index does not, forever, and nothing anywhere knows.
+**Change data capture (CDC)** reads the authoritative, ordered record of every committed change. **Debezium** turns each change into a Kafka record with before and after images: every insert, update, and delete, in commit order, with no application changes. It is the WAL of §1.6, built for crash recovery, repurposed as an integration point; CDC just reads it.
 
-The second naive approach is **polling**: `SELECT * FROM documents WHERE updated_at > ?` every few seconds. Better, and it has three real flaws. It misses deletes entirely, since a deleted row cannot be selected. It misses intermediate states — if a row changes twice between polls you see only the final value, which is fine for a search index and wrong for an audit log. And it depends on `updated_at` being maintained correctly by every code path that writes, which it will not be.
-
-**Change data capture** reads the database's own **write-ahead log** — PostgreSQL's WAL, MySQL's binlog — which is the authoritative, ordered record of every committed change. Debezium turns each change into a Kafka record containing the before and after images. You get every insert, update, and delete, in commit order, with no polling, no missed states, no application changes, and no dependence on developer discipline.
-
-Notice what this is: the WAL of §1.6, which exists so the database can recover from crashes, repurposed as an integration point. It was already there, already ordered, already durable. CDC just reads it.
-
-**Kafka Streams** is a Java library — not a cluster — for stateful stream processing. `KStream` and `KTable` abstractions, joins, windowed aggregations, with state held in a local RocksDB instance backed by a compacted changelog topic (§5.3), so that state survives losing the machine. It is an excellent fit when your processing belongs inside a JVM microservice and both ends are Kafka. It is a poor fit for heavy analytics or non-Kafka sources. **ksqlDB** puts SQL on top of it.
+**Kafka Streams** is a Java library — not a cluster — for stateful stream processing: `KStream` and `KTable`, joins, windowed aggregations, with state in local RocksDB backed by a compacted changelog topic (§5.3). Good when processing lives in a JVM microservice and both ends are Kafka; poor for heavy analytics or non-Kafka sources. **ksqlDB** puts SQL on top of it.
 
 **Schema Registry** — see §4.5. Use it.
 
-**MirrorMaker 2** replicates topics between clusters for disaster recovery and geographic distribution. **Cruise Control** automates partition rebalancing and broker capacity management, and becomes worth deploying somewhere around the point where you have more brokers than you can think about individually.
+**MirrorMaker 2** replicates topics between clusters for disaster recovery and geographic distribution. **Cruise Control** automates partition rebalancing and broker capacity management, worth it once you have more brokers than you can think about individually.
 
 ## 5.8 Operating it
 
 ### What to watch
 
-Beyond consumer lag, which §5.5 covered:
+Beyond consumer lag (§5.5):
 
-**Under-replicated partitions** should be **zero**. Any sustained non-zero value means a follower has fallen out of an ISR, which means your durability margin is gone — you are running with fewer effective copies than you designed for, and the next failure may not be survivable. Treat it as urgent rather than informational.
-
-**Offline partitions** should be **zero**, always. A non-zero value means some data is unavailable right now.
-
-**ISR shrink and expand rate.** Frequent flapping indicates brokers that are struggling — slow disks, network saturation, GC.
-
-**Request latency** at p99 for both produce and fetch. **Disk usage and its growth rate**, since retention is only as good as the disk it fits on. **Active controller count**, which must be exactly one.
+| Metric | Healthy | Why |
+|---|---|---|
+| **Under-replicated partitions** | **zero** | non-zero means a follower left an ISR and your durability margin is gone; treat as urgent |
+| **Offline partitions** | **zero**, always | some data is unavailable right now |
+| ISR shrink/expand rate | low | flapping means struggling brokers: slow disks, network saturation, GC |
+| Produce and fetch p99 latency | stable | — |
+| Disk usage and growth rate | headroom | retention is only as good as the disk it fits on |
+| Active controller count | exactly one | — |
 
 ### Resource shape
 
-Kafka is **disk-I/O and network bound**, and almost never CPU bound. This shapes your choices: fast disks matter, plentiful page cache matters, and co-locating brokers with CPU-hungry neighbours is less harmful than you might assume.
-
-And, as §5.3 noted, **leave most of the RAM to the operating system's page cache** rather than the JVM heap. A heap of around six gigabytes is typical even on a large broker. Recent data is then served from cache with zero disk reads, which is where Kafka's throughput comes from. This is the same principle as OpenSearch's filesystem cache (§2.11), for the same underlying reason: both systems rely on the OS to cache memory-mapped files, and both are harmed by a greedy heap.
+Kafka is **disk-I/O and network bound**, almost never CPU bound, so fast disks and page cache matter most. As §5.3 noted, **leave most RAM to the OS page cache**; around six gigabytes of heap is typical even on a large broker. Same principle as OpenSearch (§2.11): both rely on the OS to cache memory-mapped files, and a greedy heap hurts both.
 
 ### A table of symptoms
 
@@ -389,13 +356,11 @@ And, as §5.3 noted, **leave most of the RAM to the operating system's page cach
 | Disk filling | retention too long | tune retention; tiered storage |
 | One bad record stalls a partition | no error handling | DLQ and skip; never block indefinitely |
 
-That last row deserves a sentence. A record that always throws — a malformed payload, a schema violation — will be retried, fail, be retried, and fail, forever, and **everything behind it in the partition stops.** This is head-of-line blocking, and because the partition is a strict serial log there is no way around the bad record. It must be routed to a dead-letter queue and skipped. A pipeline without a DLQ is a pipeline with an unhandled halt condition.
+That last row is **head-of-line blocking**. A record that always throws — a malformed payload, a schema violation — is retried and fails forever, and **everything behind it in the partition stops**, because a partition is a strict serial log. Route it to a dead-letter queue and skip it.
 
 ### A checklist for a new topic
 
-Seven questions, and having written them down you will not regret it:
-
-1. **What is the key**, what ordering does that buy, and is there skew risk?
+1. **What is the key**, what ordering does it buy, and is there skew risk?
 2. **How many partitions** — consumer parallelism plus headroom?
 3. **Retention**: delete or compact, and for how long?
 4. **Durability**: RF=3, `min.insync.replicas=2`, `acks=all`, unclean election off?
@@ -405,17 +370,15 @@ Seven questions, and having written them down you will not regret it:
 
 ## 5.9 Lantern gets a nervous system
 
-Here is what the pipeline now looks like.
+**Ingest.** Debezium reads PostgreSQL's write-ahead log and publishes every document insert, update, and delete to `document-changes`, **keyed by `document_id`**: twenty-four partitions, RF=3, `min.insync.replicas=2`, `acks=all`, unclean leader election disabled. Records are Avro, with schemas in a registry set to backward compatibility. The change stream keeps seven days; a parallel **compacted** topic keyed by `document_id` holds every document's current version for replay.
 
-Debezium reads PostgreSQL's write-ahead log and publishes every document insert, update, and delete to a Kafka topic called `document-changes`, **keyed by `document_id`**. Twenty-four partitions, replication factor three, `min.insync.replicas=2`, `acks=all`, unclean leader election disabled. Records are Avro, with schemas in a registry configured for backward compatibility. Retention is seven days for the change stream; a parallel **compacted** topic keyed by `document_id` holds the current version of every document, so the whole corpus can be replayed from the beginning to rebuild the index.
+**Indexing.** A consumer group called `indexer` runs twelve consumers with auto-commit disabled. For each batch it chunks the text, calls the embedding service, and sends an OpenSearch `_bulk` request keyed on `{document_id}:{chunk_index}`, so a redelivery is a no-op. Only then does it commit offsets. OpenSearch `429`s are retried with backoff; records that fail deterministically go to `document-changes-dlq` with the exception attached. Static membership keeps deploys from rebalancing the group, and an alert fires when time lag exceeds thirty seconds.
 
-A consumer group called `indexer` reads `document-changes` with twelve consumers, auto-commit disabled. For each batch it chunks the document text, calls the embedding service, and issues an OpenSearch `_bulk` request keyed on `{document_id}:{chunk_index}` — idempotent, so a redelivery is a no-op. Only then does it commit offsets. `429` responses from OpenSearch are retried with backoff. Records that fail deterministically go to `document-changes-dlq` with the exception attached. Static membership means deploys don't rebalance the group. Lag is monitored in both records and seconds, and alerts when time lag exceeds thirty seconds.
+**Archive.** A second, independent group archives the raw change stream to S3 as Avro: the raw layer of §4.2, from which everything can be re-derived.
 
-A second, entirely independent group archives the raw change stream to S3 as Avro, which is the raw layer of §4.2 — the thing everything can be re-derived from.
+The database no longer knows the search index exists. The indexer can be stopped, redeployed, or rewound three hours without anything upstream noticing. When Chapter 3's embedding model is upgraded, the replay path already exists: read the compacted topic from offset zero into a new index, verify, swap the alias.
 
-Look at what this bought us. The database no longer knows the search index exists; Debezium reads a log the database was writing anyway. The indexer can be stopped for an hour, redeployed, or rewound three hours, and nothing upstream notices. The nightly analytics job and the audit archive read the same stream without any coordination. When Chapter 3's embedding model is upgraded, the replay path already exists: read the compacted topic from offset zero into a new index, verify, swap the alias.
-
-And we can now be precise about the latency budget:
+The latency budget:
 
 ```
 PostgreSQL commit → Debezium reads WAL        ~100 ms – 1 s
@@ -428,16 +391,23 @@ OpenSearch refresh interval                   ~1 s          ← the largest term
 end to end                                    ~1.5 – 3 s
 ```
 
-Which meets the requirement, and — more usefully — tells us that if we ever need it faster, the refresh interval is where to look first, not the pipeline.
+That meets the requirement, and if we ever need it faster, look at the refresh interval first, not the pipeline.
 
 ---
 
+## Key takeaways
+
+- Kafka is an append-only log, not a queue: reads don't consume, and consumers control their own position, so data fans out and can be replayed.
+- Ordering holds only within a partition; parallelism is capped at one consumer per partition per group.
+- Key by the entity that needs ordering, and nothing coarser; a skewed key cannot be fixed by adding capacity.
+- Over-provision partitions 2–3× at creation, because adding partitions later breaks key-to-partition mapping.
+- `replication.factor=3`, `min.insync.replicas=2`, `acks=all`, and unclean leader election off survive any single broker loss with zero data loss.
+- Compacted topics keep the latest record per key, turning a log into a replayable table.
+- Leave `enable.idempotence` on; it removes retry duplicates and reordering for free.
+- Disable auto-commit and commit after processing; otherwise a crash silently skips records.
+- Watch lag in records and in time; its shape diagnoses most problems.
+- Exactly-once covers only Kafka to Kafka; for external sinks, use at-least-once plus an idempotent write.
+
 ## Where we are
 
-Kafka is a log, and the log's three properties — immutable sequential appends, non-destructive reads, consumer-controlled position — give us durability, fan-out to unlimited independent consumers, and the ability to rewind. Partitions provide parallelism, keys provide per-entity ordering, and the tension between those two is where the design work lives. Three settings (`acks=all`, `min.insync.replicas=2`, RF=3) buy zero-loss durability through any single failure. Idempotent producers eliminate retry duplicates for free. And the honest end-to-end guarantee is at-least-once delivery combined with an idempotent sink, which is entirely sufficient.
-
-But look again at what the indexer consumer actually does. It processes each record independently: chunk it, embed it, write it. It holds no memory of anything. It never needs to know what happened five minutes ago, or to count something over a window, or to join two streams together.
-
-That is a *stateless* transformation, and it is the easy case. The moment you want to count events per document per hour, or detect that a document has been edited five times in ten minutes, or join a document change against a stream of view events — you need to remember things. Across crashes. For months. While events arrive late and out of order and you must decide when an hour is finally over.
-
-That is a much harder problem, and it has the best answer in Chapter 6.
+Lantern's indexer is stateless: it chunks, embeds, and writes each record on its own, with no memory of what came before. The moment you want to count edits per document per hour, or join document changes against view events, you need state that survives crashes while late, out-of-order events arrive. That harder problem gets its best answer in Chapter 6.
